@@ -20,7 +20,8 @@ env/
 # Pipeline outputs
 # data/
 results/
-plots/
+plots/*
+!plots/*.png
 
 # Jupyter
 .ipynb_checkpoints/
