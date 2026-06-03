@@ -33,9 +33,9 @@ for _dir in (DATA_DIR, RESULTS_DIR, PLOTS_DIR):
 # LLM model identifiers (passed directly to litellm.completion)
 # ---------------------------------------------------------------------------
 
-GENERATION_MODEL: str = os.getenv("GENERATION_MODEL", "gpt-4o")
-JUDGE_MODEL: str = os.getenv("JUDGE_MODEL", "gpt-4o")
-SUMMARIZATION_MODEL: str = os.getenv("SUMMARIZATION_MODEL", "gpt-4o-mini")
+GENERATION_MODEL: str = os.getenv("GENERATION_MODEL", "gemini/gemini-2.5-flash")
+JUDGE_MODEL: str = os.getenv("JUDGE_MODEL", "gemini/gemini-2.5-flash")
+SUMMARIZATION_MODEL: str = os.getenv("SUMMARIZATION_MODEL", "gemini/gemini-2.5-flash")
 
 # Tiktoken encoding used everywhere in the pipeline.
 TIKTOKEN_ENCODING: str = "cl100k_base"
@@ -59,9 +59,10 @@ HYBRID_K_VALUES: list[int] = [2, 4, 6]
 # Dataset generation settings
 # ---------------------------------------------------------------------------
 
-DATASET_SIZE: int = 30            # Total conversations to generate
-BATCH_SIZE: int = 10              # Conversations per LLM call
+DATASET_SIZE: int = 36            # 3 domains × 4 turn values × 3 conversations
+BATCH_SIZE: int = 3               # Conversations per turn-value sub-batch
 MAX_RETRIES: int = 3              # Max re-generation attempts per failed conversation
+TURN_COUNTS: list[int] = [6, 8, 10, 12]  # Exact history turn counts; 3 conversations each
 
 GENERATION_DOMAINS: list[str] = [
     "inventory and logistics",

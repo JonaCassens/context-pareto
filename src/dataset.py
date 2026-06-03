@@ -21,6 +21,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+import time
+
 import litellm
 from pydantic import ValidationError
 
@@ -31,6 +33,7 @@ from src.config import (
     GENERATION_DOMAINS,
     GENERATION_MODEL,
     MAX_RETRIES,
+    TURN_COUNTS,
 )
 from src.models import Conversation, GeneratedDataset
 
@@ -58,8 +61,9 @@ Generate exactly {n} synthetic multi-turn conversations in the domain of \
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 STRUCTURAL RULES
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-1. Each conversation has between 5 and 9 history turns (role alternates
-   user / assistant, starting with user).
+1. Each conversation must have EXACTLY {target_turns} history turns (role
+   alternates user / assistant, starting with user). Do NOT use more or
+   fewer turns — this count is a strict requirement.
 2. The conversation ends with a `final_question` posed by the user that is
    NOT part of `history`.
 3. `ground_truth_answer` is the single, unambiguous correct answer to
@@ -142,9 +146,9 @@ Return ONLY a JSON object matching this schema:
 """
 
 
-def build_batch_prompt(n: int, domain: str) -> str:
+def build_batch_prompt(n: int, domain: str, target_turns: int) -> str:
     """Return the user-turn prompt for generating ``n`` conversations in ``domain``."""
-    return _BATCH_PROMPT_TEMPLATE.format(n=n, domain=domain)
+    return _BATCH_PROMPT_TEMPLATE.format(n=n, domain=domain, target_turns=target_turns)
 
 
 # ---------------------------------------------------------------------------
@@ -171,26 +175,47 @@ def validate_dependency_spread(conv: Conversation) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _call_litellm(prompt: str, model: str) -> dict[str, Any]:
+def _call_litellm(
+    prompt: str,
+    model: str,
+    max_retries: int = MAX_RETRIES,
+) -> dict[str, Any]:
     """
     Call litellm with JSON response format and return the parsed dict.
-    Raises RuntimeError on API or JSON-parse failures.
+
+    Retries on rate-limit (429) errors with exponential backoff.
+    Raises RuntimeError on API or JSON-parse failures after all retries.
     """
-    response = litellm.completion(
-        model=model,
-        messages=[
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.9,   # High enough for variety across 10 conversations
-        max_tokens=8192,
-    )
-    raw = response.choices[0].message.content
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"LLM returned non-JSON content: {raw[:200]}") from exc
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = litellm.completion(
+                model=model,
+                messages=[
+                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.9,
+                max_tokens=32768,  # Generous budget; thinking models consume tokens for reasoning
+            )
+            raw = response.choices[0].message.content
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"LLM returned non-JSON content: {raw[:200]}") from exc
+
+        except (litellm.RateLimitError, litellm.ServiceUnavailableError) as exc:
+            wait = 2 ** attempt  # 2s, 4s, 8s …
+            logger.warning(
+                "Transient API error (attempt %d/%d). Waiting %ds before retry. %s",
+                attempt, max_retries, wait, exc,
+            )
+            if attempt == max_retries:
+                raise RuntimeError(f"Transient API error persisted after {max_retries} retries.") from exc
+            time.sleep(wait)
+
+        except litellm.APIError as exc:
+            raise RuntimeError(f"LiteLLM API error: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -203,16 +228,17 @@ def generate_batch(
     n: int = BATCH_SIZE,
     model: str = GENERATION_MODEL,
     max_retries: int = MAX_RETRIES,
+    target_turns: int = 8,
 ) -> list[Conversation]:
     """
     Generate ``n`` conversations for the given ``domain``.
 
     Retries individual conversations that fail Pydantic validation (e.g.,
-    dependency-spread rule) up to ``max_retries`` times per conversation.
-    Returns however many valid conversations were produced.
+    dependency-spread rule) or have the wrong turn count up to ``max_retries``
+    times per conversation.  Returns however many valid conversations were produced.
     """
-    logger.info("Generating batch: domain=%r  n=%d  model=%s", domain, n, model)
-    prompt = build_batch_prompt(n=n, domain=domain)
+    logger.info("Generating batch: domain=%r  n=%d  turns=%d  model=%s", domain, n, target_turns, model)
+    prompt = build_batch_prompt(n=n, domain=domain, target_turns=target_turns)
 
     raw_dict: dict[str, Any] = {}
     for attempt in range(1, max_retries + 1):
@@ -235,8 +261,15 @@ def generate_batch(
             raw_conv["id"] = str(uuid.uuid4())
         try:
             conv = Conversation.model_validate(raw_conv)
-            valid.append(conv)
-            logger.debug("  ✓ %s  (critical=%s)", conv.id, conv.critical_turn_indices)
+            if len(conv.history) != target_turns:
+                logger.warning(
+                    "  ✗ Wrong turn count: expected %d, got %d",
+                    target_turns, len(conv.history),
+                )
+                invalid_raws.append(raw_conv)
+            else:
+                valid.append(conv)
+                logger.debug("  ✓ %s  (critical=%s)", conv.id, conv.critical_turn_indices)
         except ValidationError as exc:
             logger.warning("  ✗ Validation failed for a conversation: %s", exc.errors()[0]["msg"])
             invalid_raws.append(raw_conv)
@@ -244,7 +277,7 @@ def generate_batch(
     # Retry each invalid conversation individually.
     if invalid_raws:
         logger.info("  Re-generating %d failed conversations …", len(invalid_raws))
-        retry_prompt = build_batch_prompt(n=len(invalid_raws), domain=domain)
+        retry_prompt = build_batch_prompt(n=len(invalid_raws), domain=domain, target_turns=target_turns)
         for attempt in range(1, max_retries + 1):
             try:
                 retry_dict = _call_litellm(retry_prompt, model)
@@ -271,18 +304,22 @@ def generate_conversations(
     model: str = GENERATION_MODEL,
 ) -> list[Conversation]:
     """
-    Generate ``total`` conversations spread evenly across all configured domains.
+    Generate conversations with exactly 3 per (domain, turn_count) combination.
 
-    Uses one LLM call per domain (3 calls × 10 conversations = 30 total).
+    Produces 3 domains × 4 turn counts × 3 conversations = 36 total.
+    Each sub-batch (12 LLM calls) targets an exact turn count from TURN_COUNTS.
     """
     all_conversations: list[Conversation] = []
-    per_domain = total // len(GENERATION_DOMAINS)
-    remainder = total % len(GENERATION_DOMAINS)
 
-    for i, domain in enumerate(GENERATION_DOMAINS):
-        n = per_domain + (1 if i < remainder else 0)
-        batch = generate_batch(domain=domain, n=n, model=model)
-        all_conversations.extend(batch)
+    for domain in GENERATION_DOMAINS:
+        for target_turns in TURN_COUNTS:
+            batch = generate_batch(
+                domain=domain,
+                n=BATCH_SIZE,
+                model=model,
+                target_turns=target_turns,
+            )
+            all_conversations.extend(batch)
 
     logger.info("Total valid conversations generated: %d / %d", len(all_conversations), total)
     return all_conversations
@@ -337,6 +374,14 @@ def inspect_dataset(conversations: list[Conversation]) -> None:
     print("\nDomain distribution:")
     for domain, count in sorted(domain_counts.items()):
         print(f"  {domain:<45} {count:>3} conversations")
+
+    turn_counts: dict[int, int] = {}
+    for conv in conversations:
+        n = len(conv.history)
+        turn_counts[n] = turn_counts.get(n, 0) + 1
+    print("\nTurn-count distribution:")
+    for turns, count in sorted(turn_counts.items()):
+        print(f"  {turns:>2} turns   {count:>3} conversations")
 
     print("\nSample conversations (first 3):")
     for conv in conversations[:3]:

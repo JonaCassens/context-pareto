@@ -34,7 +34,7 @@ class Conversation(BaseModel):
 
     id: str
     domain: str = Field(description="High-level domain label (e.g. 'inventory', 'finance').")
-    history: list[Turn] = Field(min_length=4, max_length=10)
+    history: list[Turn] = Field(min_length=6, max_length=12)
     final_question: str
     ground_truth_answer: str = Field(
         description=(
