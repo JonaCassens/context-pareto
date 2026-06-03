@@ -18,7 +18,7 @@ venv/
 env/
 
 # Pipeline outputs
-data/
+# data/
 results/
 plots/
 
