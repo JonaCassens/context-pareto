@@ -4,7 +4,7 @@ Last updated: 2026-06-03
 
 ## Project Snapshot
 - Project: LEC context compression evaluation pipeline
-- Goal: compare compression quality tradeoff across sliding window, summarization, and hybrid retrieval for multi-turn conversations
+- Goal: compare compression quality tradeoff across sliding window, summarization, and an online hybrid compressor that works during turns without future-question leakage
 - Root: c:/Users/jonat/OneDrive/Documents/Work/LEC
 
 ## Assignment 3 Goal Context
@@ -31,6 +31,10 @@ Last updated: 2026-06-03
   - justify choice with evidence
   - include one concrete failure case where compressed context loses information preserved by full history
   - explain failure mechanism
+
+### Online Hybrid Constraint
+- Hybrid compression must operate during conversation turns and must not use final_question for selection.
+- Any strategy component that depends on unseen future query context is disallowed for the hybrid implementation.
 
 ### Mapping to This Repo
 - Three strategies map to src/compressors.py implementations
@@ -68,7 +72,7 @@ Last updated: 2026-06-03
 
 ## Milestone Status
 - Milestone 1 dataset generation: complete
-- Milestone 2 compressors: complete in code and smoke tested
+- Milestone 2 compressors: complete with online hybrid (no final-question leakage)
 - Milestone 3 evaluation engine: implemented and smoke-run validated
 - Milestone 4 reporting and plots: implemented and artifact generation validated
 
@@ -105,6 +109,18 @@ Last updated: 2026-06-03
     - assignment writeup output to results/assignment3_findings.md
   - Executed bounded eval run (1 conversation, 3 combinations) and produced initial results records
   - Generated reporting artifacts from current results snapshot
+  - Decision update: replacing existing query-aware HybridCompressor because it used final_question for turn selection.
+  - New hybrid target: online compressor that combines
+    - recent-window retention
+    - optional summary of older context under token budget
+    - question-agnostic anchor turn selection from older context
+  - Implemented online HybridCompressor revision:
+    - removed final_question dependency from hybrid turn selection
+    - added recent_window and summary_token_limit hybrid controls
+    - anchor selection now uses question-agnostic heuristics (numbers, units, IDs, boundary bias)
+    - hybrid hyperparams now logged as k + recent_window + summary_token_limit
+  - Updated report failure-case inference to remain API-free with the revised hybrid behavior.
+  - Re-ran compressor smoke tests and confirmed all checks pass.
 
 ## Remaining Work Checklist
 
@@ -122,6 +138,13 @@ Last updated: 2026-06-03
 - [x] Execute bounded live eval smoke run and confirm writes
 - [ ] Execute full eval grid and confirm resume behavior across reruns
 
+### Hybrid Revision
+- [x] Update config to define online hybrid hyperparameter grid
+- [x] Replace HybridCompressor implementation to remove final_question dependency
+- [x] Update all_compressors() factory to instantiate revised hybrid values
+- [x] Update smoke tests for revised hybrid behavior
+- [ ] Re-run bounded eval and refresh report artifacts due to strategy behavior change
+
 ### Milestone 4 report.py
 - [x] Load eval results from JSONL
 - [x] Aggregate accuracy by strategy and hyperparameters
@@ -138,6 +161,7 @@ Last updated: 2026-06-03
 - Conversation validation is strict, especially critical turn spread constraints
 - sentence-transformers model download happens on first hybrid usage
 - Use absolute Python path in PowerShell contexts where python alias resolution can fail
+- Query-aware retrieval using final_question is not valid for during-turn hybrid compression; avoid future-question leakage
 
 ## Run Commands
 - Compressor smoke test:

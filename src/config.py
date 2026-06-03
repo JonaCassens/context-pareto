@@ -51,8 +51,14 @@ WINDOW_SIZES: list[int] = [2, 4, 6]
 # SummarizationCompressor: target token budget for the summary block
 SUMMARY_TOKEN_LIMITS: list[int] = [100, 200, 400]
 
-# HybridCompressor: top-K turns to retrieve via semantic similarity
+# Online HybridCompressor: anchors sampled from older context
 HYBRID_K_VALUES: list[int] = [2, 4, 6]
+
+# Online HybridCompressor: recent turns kept verbatim
+HYBRID_RECENT_WINDOW: int = int(os.getenv("HYBRID_RECENT_WINDOW", "2"))
+
+# Online HybridCompressor: summary budget for older context before anchors are selected
+HYBRID_SUMMARY_TOKEN_LIMIT: int = int(os.getenv("HYBRID_SUMMARY_TOKEN_LIMIT", "160"))
 
 
 # ---------------------------------------------------------------------------

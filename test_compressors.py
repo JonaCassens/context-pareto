@@ -49,14 +49,17 @@ print(f"SlidingWindow(10 > len=6): {len(result)} turns  [PASS]")
 # --- HybridCompressor ---
 hy2 = HybridCompressor(2)
 result = hy2.compress(conv)
-assert len(result) == 2, f"Expected 2 turns, got {len(result)}"
-# All indices must be in original order
-print(f"Hybrid(k=2): {len(result)} turns  [PASS]")
+assert len(result) >= 2, f"Expected at least 2 turns, got {len(result)}"
+assert result[-2] == turns[-2]
+assert result[-1] == turns[-1]
+print(f"Hybrid(k=2): {len(result)} turns with recent-window retention  [PASS]")
 
 hy10 = HybridCompressor(10)
 result = hy10.compress(conv)
-assert len(result) == 6, "k > len should clamp to len"
-print(f"Hybrid(k=10 > len=6): {len(result)} turns  [PASS]")
+assert len(result) >= 2, "Hybrid should always retain recent context"
+assert result[-2] == turns[-2]
+assert result[-1] == turns[-1]
+print(f"Hybrid(k=10 > len=6): {len(result)} turns with recent-window retention  [PASS]")
 
 # --- Factory ---
 cs = all_compressors()

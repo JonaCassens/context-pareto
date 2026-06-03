@@ -6,6 +6,7 @@ Builds DataFrame, calculates metrics, plots Pareto frontier.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,7 +15,7 @@ import seaborn as sns
 from matplotlib import pyplot as plt
 from pydantic import ValidationError
 
-from src.compressors import HybridCompressor
+from src.config import HYBRID_RECENT_WINDOW
 from src.config import DATASET_PATH, PLOTS_DIR, RESULTS_DIR, RESULTS_PATH
 from src.dataset import load_dataset
 from src.models import Conversation, EvalRecord
@@ -303,12 +304,37 @@ def _infer_kept_indices(conversation: Conversation, strategy: str, hyperparams_k
 
 	if strategy == "hybrid":
 		k = int(parts.get("k", "1"))
-		compressor = HybridCompressor(k)
-		compressed_turns = compressor.compress(conversation)
-		return [
-			i for i, turn in enumerate(history)
-			if any(turn == kept for kept in compressed_turns)
-		]
+		recent_window = int(parts.get("recent_window", str(HYBRID_RECENT_WINDOW)))
+		recent_n = min(recent_window, len(history))
+		recent_start = len(history) - recent_n
+		older = history[:recent_start]
+
+		def _priority(turn: object, idx: int, total: int) -> tuple[float, int]:
+			text = turn.content
+			has_number = bool(re.search(r"\\d", text))
+			has_unit = bool(re.search(r"\\b(?:usd|dollars?|%|kg|km|hours?|days?|weeks?|months?)\\b", text.lower()))
+			has_id = bool(re.search(r"\\b[A-Z]{2,}-?\\d{1,}\\b", text))
+			length_bonus = min(len(text) / 300.0, 1.0)
+			first_third = max(total // 3, 1)
+			last_third_start = total - first_third
+			boundary_bonus = 1.0 if idx < first_third or idx >= last_third_start else 0.0
+			score = (
+				(2.0 if has_number else 0.0)
+				+ (1.5 if has_unit else 0.0)
+				+ (1.0 if has_id else 0.0)
+				+ length_bonus
+				+ boundary_bonus
+			)
+			return (score, idx)
+
+		anchor_count = min(k, len(older))
+		chosen_older: list[int] = []
+		if anchor_count > 0:
+			priorities = [(_priority(turn, idx, len(history)), idx) for idx, turn in enumerate(older)]
+			priorities.sort(reverse=True)
+			chosen_older = sorted(idx for _, idx in priorities[:anchor_count])
+
+		return chosen_older + list(range(recent_start, len(history)))
 
 	raise ValueError(f"Unsupported strategy for failure analysis: {strategy}")
 

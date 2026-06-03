@@ -6,15 +6,16 @@ Implementations: SlidingWindowCompressor, SummarizationCompressor, HybridCompres
 from __future__ import annotations
 
 import time
+import re
 from abc import ABC, abstractmethod
 
 import litellm
-import numpy as np
 import tiktoken
-from sentence_transformers import SentenceTransformer
 
 from src.config import (
     HYBRID_K_VALUES,
+    HYBRID_RECENT_WINDOW,
+    HYBRID_SUMMARY_TOKEN_LIMIT,
     MAX_RETRIES,
     SUMMARIZATION_MODEL,
     SUMMARY_TOKEN_LIMITS,
@@ -34,23 +35,6 @@ _SUMMARY_SYSTEM_PROMPT = (
 
 def _turns_to_text(turns: list[Turn]) -> str:
     return "\n".join(f"{turn.role}: {turn.content}" for turn in turns)
-
-
-def _cosine_similarity(query: np.ndarray, matrix: np.ndarray) -> np.ndarray:
-    query_norm = np.linalg.norm(query)
-    matrix_norm = np.linalg.norm(matrix, axis=1)
-    denom = np.maximum(query_norm * matrix_norm, 1e-12)
-    return np.dot(matrix, query) / denom
-
-
-_EMBEDDER: SentenceTransformer | None = None
-
-
-def _get_embedder() -> SentenceTransformer:
-    global _EMBEDDER
-    if _EMBEDDER is None:
-        _EMBEDDER = SentenceTransformer("all-MiniLM-L6-v2")
-    return _EMBEDDER
 
 
 class Compressor(ABC):
@@ -168,29 +152,72 @@ class HybridCompressor(Compressor):
         if k <= 0:
             raise ValueError("k must be > 0")
         self.k = k
+        self.recent_window = HYBRID_RECENT_WINDOW
+        self.summary_token_limit = HYBRID_SUMMARY_TOKEN_LIMIT
+        self._encoder = tiktoken.get_encoding(TIKTOKEN_ENCODING)
+
+    def _count_tokens(self, text: str) -> int:
+        return len(self._encoder.encode(text))
+
+    def _turn_priority(self, turn: Turn, idx: int, total: int) -> tuple[float, int]:
+        text = turn.content
+        has_number = bool(re.search(r"\\d", text))
+        has_unit = bool(re.search(r"\\b(?:usd|dollars?|%|kg|km|hours?|days?|weeks?|months?)\\b", text.lower()))
+        has_id = bool(re.search(r"\\b[A-Z]{2,}-?\\d{1,}\\b", text))
+        length_bonus = min(len(text) / 300.0, 1.0)
+
+        # Encourage preserving both early and late anchors without using unseen future question.
+        first_third = max(total // 3, 1)
+        last_third_start = total - first_third
+        boundary_bonus = 1.0 if idx < first_third or idx >= last_third_start else 0.0
+
+        score = (
+            (2.0 if has_number else 0.0)
+            + (1.5 if has_unit else 0.0)
+            + (1.0 if has_id else 0.0)
+            + length_bonus
+            + boundary_bonus
+        )
+        return (score, idx)
+
+    def _summarize_older(self, older_turns: list[Turn]) -> Turn | None:
+        if not older_turns:
+            return None
+        older_text = _turns_to_text(older_turns)
+        if self._count_tokens(older_text) <= self.summary_token_limit:
+            return None
+        summary = SummarizationCompressor(self.summary_token_limit)._summarize_prefix(older_turns)
+        return Turn(role="assistant", content=summary)
 
     def compress(self, conversation: Conversation) -> list[Turn]:
         history = conversation.history
         if not history:
             return []
 
-        k = min(self.k, len(history))
-        embedder = _get_embedder()
+        recent_n = min(self.recent_window, len(history))
+        recent_start = len(history) - recent_n
+        recent_turns = history[recent_start:]
+        older_turns = history[:recent_start]
 
-        query_embedding = np.asarray(
-            embedder.encode([conversation.final_question], convert_to_numpy=True)[0],
-            dtype=np.float32,
-        )
-        turn_texts = [f"{t.role}: {t.content}" for t in history]
-        turn_embeddings = np.asarray(
-            embedder.encode(turn_texts, convert_to_numpy=True),
-            dtype=np.float32,
-        )
-        scores = _cosine_similarity(query_embedding, turn_embeddings)
+        anchor_count = min(self.k, len(older_turns))
+        selected_older: list[Turn] = []
+        if anchor_count > 0:
+            priorities = [
+                (self._turn_priority(turn, idx, len(history)), idx)
+                for idx, turn in enumerate(older_turns)
+            ]
+            priorities.sort(reverse=True)
+            chosen = sorted(idx for _, idx in priorities[:anchor_count])
+            selected_older = [older_turns[i] for i in chosen]
 
-        top_indices = np.argpartition(scores, -k)[-k:]
-        ordered_indices = sorted(int(i) for i in top_indices)
-        return [history[i] for i in ordered_indices]
+        summary_turn = self._summarize_older(older_turns)
+
+        out: list[Turn] = []
+        if summary_turn is not None:
+            out.append(summary_turn)
+        out.extend(selected_older)
+        out.extend(recent_turns)
+        return out
 
     @property
     def name(self) -> str:
@@ -198,7 +225,11 @@ class HybridCompressor(Compressor):
 
     @property
     def hyperparams(self) -> dict:
-        return {"k": self.k}
+        return {
+            "k": self.k,
+            "recent_window": self.recent_window,
+            "summary_token_limit": self.summary_token_limit,
+        }
 
 
 def all_compressors() -> list[Compressor]:
