@@ -25,11 +25,15 @@ from typing import Any
 import time
 
 import litellm
+import tiktoken
 from pydantic import ValidationError
 
 from src.config import (
     BATCH_SIZE,
+    CONTEXT_WINDOW_MARGIN,
     DATASET_PATH,
+    DATASET_GENERATION_CONTEXT_WINDOW,
+    DATASET_GENERATION_MAX_TOKENS,
     DATASET_SIZE,
     GENERATION_DOMAINS,
     GENERATION_MODEL,
@@ -263,6 +267,25 @@ def _call_litellm(
     Retries on rate-limit (429) errors with exponential backoff.
     Raises RuntimeError on API or JSON-parse failures after all retries.
     """
+    encoder = tiktoken.get_encoding("cl100k_base")
+    input_budget = (
+        DATASET_GENERATION_CONTEXT_WINDOW
+        - DATASET_GENERATION_MAX_TOKENS
+        - CONTEXT_WINDOW_MARGIN
+    )
+    if input_budget <= 0:
+        raise RuntimeError(
+            "Invalid dataset-generation token budget. Increase DATASET_GENERATION_CONTEXT_WINDOW "
+            "or reduce DATASET_GENERATION_MAX_TOKENS/CONTEXT_WINDOW_MARGIN."
+        )
+
+    prompt_tokens = len(encoder.encode(prompt))
+    if prompt_tokens > input_budget:
+        raise RuntimeError(
+            "Dataset-generation prompt exceeds context budget without clipping: "
+            f"prompt={prompt_tokens} budget={input_budget}. Increase DATASET_GENERATION_CONTEXT_WINDOW."
+        )
+
     for attempt in range(1, max_retries + 1):
         try:
             response = litellm.completion(
@@ -273,7 +296,7 @@ def _call_litellm(
                 ],
                 response_format={"type": "json_object"},
                 temperature=0.9,
-                max_tokens=32768,  # Generous budget; thinking models consume tokens for reasoning
+                max_tokens=DATASET_GENERATION_MAX_TOKENS,
             )
             raw = response.choices[0].message.content
             try:

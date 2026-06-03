@@ -37,6 +37,25 @@ GENERATION_MODEL: str = os.getenv("GENERATION_MODEL", "gemini/gemini-2.5-flash")
 JUDGE_MODEL: str = os.getenv("JUDGE_MODEL", "gemini/gemini-2.5-flash")
 SUMMARIZATION_MODEL: str = os.getenv("SUMMARIZATION_MODEL", "gemini/gemini-2.5-flash")
 
+# Context windows used for input-budgeting safeguards.
+# Defaults are intentionally >= 1000 tokens plus margin for observed workloads.
+GENERATION_CONTEXT_WINDOW: int = int(os.getenv("GENERATION_CONTEXT_WINDOW", "4096"))
+SUMMARIZATION_CONTEXT_WINDOW: int = int(os.getenv("SUMMARIZATION_CONTEXT_WINDOW", "4096"))
+DATASET_GENERATION_CONTEXT_WINDOW: int = int(os.getenv("DATASET_GENERATION_CONTEXT_WINDOW", "8192"))
+CONTEXT_WINDOW_MARGIN: int = int(os.getenv("CONTEXT_WINDOW_MARGIN", "256"))
+
+# Response-token caps for faster inference and lower cost.
+# These are OUTPUT token limits and do not limit input context length.
+GENERATION_MAX_TOKENS: int = max(32, int(os.getenv("GENERATION_MAX_TOKENS", "256")))
+SUMMARIZATION_MAX_TOKENS: int = max(64, int(os.getenv("SUMMARIZATION_MAX_TOKENS", "512")))
+DATASET_GENERATION_MAX_TOKENS: int = max(512, int(os.getenv("DATASET_GENERATION_MAX_TOKENS", "4096")))
+
+# Emit an info log when a conversation reaches this many input tokens.
+EVAL_CONTEXT_WARNING_TOKENS: int = int(os.getenv("EVAL_CONTEXT_WARNING_TOKENS", "1000"))
+
+# Parallel workers for eval combo execution.
+EVAL_MAX_WORKERS: int = int(os.getenv("EVAL_MAX_WORKERS", "4"))
+
 # Tiktoken encoding used everywhere in the pipeline.
 TIKTOKEN_ENCODING: str = "cl100k_base"
 

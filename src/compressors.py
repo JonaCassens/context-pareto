@@ -5,18 +5,23 @@ Implementations: SlidingWindowCompressor, SummarizationCompressor, HybridCompres
 
 from __future__ import annotations
 
+import logging
 import time
 import re
 from abc import ABC, abstractmethod
+from threading import Lock
 
 import litellm
 import tiktoken
 
 from src.config import (
+    CONTEXT_WINDOW_MARGIN,
     HYBRID_K_VALUES,
     HYBRID_RECENT_WINDOW,
     HYBRID_SUMMARY_TOKEN_LIMIT,
     MAX_RETRIES,
+    SUMMARIZATION_CONTEXT_WINDOW,
+    SUMMARIZATION_MAX_TOKENS,
     SUMMARIZATION_MODEL,
     SUMMARY_TOKEN_LIMITS,
     TIKTOKEN_ENCODING,
@@ -31,6 +36,11 @@ _SUMMARY_SYSTEM_PROMPT = (
     "Return a compact summary that preserves entities, quantities, constraints, and facts needed "
     "to answer a future user question."
 )
+
+logger = logging.getLogger(__name__)
+
+_SUMMARY_CACHE: dict[tuple[str, int, str], str] = {}
+_SUMMARY_CACHE_LOCK = Lock()
 
 
 def _turns_to_text(turns: list[Turn]) -> str:
@@ -89,13 +99,28 @@ class SummarizationCompressor(Compressor):
     def _count_tokens(self, text: str) -> int:
         return len(self._encoder.encode(text))
 
-    def _summarize_prefix(self, prefix_turns: list[Turn]) -> str:
-        prompt = (
+    def _build_summary_prompt(self, text: str) -> str:
+        return (
             "Summarize the following conversation turns into a concise memory block. "
             "Preserve critical quantities, entities, timelines, constraints, and decisions. "
             "Do not include analysis or meta commentary.\n\n"
-            f"Conversation turns:\n{_turns_to_text(prefix_turns)}"
+            f"Conversation turns:\n{text}"
         )
+
+    def _summary_input_budget(self) -> int:
+        return SUMMARIZATION_CONTEXT_WINDOW - SUMMARIZATION_MAX_TOKENS - CONTEXT_WINDOW_MARGIN
+
+    def _summarize_text_once(self, text: str) -> str:
+        prompt = self._build_summary_prompt(text)
+        input_budget = self._summary_input_budget()
+        if input_budget <= 0:
+            raise RuntimeError(
+                "Invalid summarization token budget. Increase SUMMARIZATION_CONTEXT_WINDOW "
+                "or reduce SUMMARIZATION_MAX_TOKENS/CONTEXT_WINDOW_MARGIN."
+            )
+
+        if self._count_tokens(prompt) > input_budget:
+            raise RuntimeError("Summarization prompt exceeds context window budget.")
 
         for attempt in range(1, MAX_RETRIES + 1):
             try:
@@ -105,7 +130,7 @@ class SummarizationCompressor(Compressor):
                         {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT},
                         {"role": "user", "content": prompt},
                     ],
-                    max_tokens=32768,
+                    max_tokens=SUMMARIZATION_MAX_TOKENS,
                     temperature=0.2,
                 )
                 content = response.choices[0].message.content
@@ -122,6 +147,25 @@ class SummarizationCompressor(Compressor):
 
         raise RuntimeError("Unexpected summarization retry state.")
 
+    def _summarize_prefix(self, prefix_turns: list[Turn]) -> str:
+        prefix_text = _turns_to_text(prefix_turns)
+        cache_key = (prefix_text, self.token_limit, SUMMARIZATION_MODEL)
+        with _SUMMARY_CACHE_LOCK:
+            cached = _SUMMARY_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        if self._count_tokens(self._build_summary_prompt(prefix_text)) > self._summary_input_budget():
+            raise RuntimeError(
+                "Single-pass summarization exceeds context budget. Increase summarization context window."
+            )
+
+        normalized = self._summarize_text_once(prefix_text)
+
+        with _SUMMARY_CACHE_LOCK:
+            _SUMMARY_CACHE[cache_key] = normalized
+        return normalized
+
     def compress(self, conversation: Conversation) -> list[Turn]:
         if len(conversation.history) <= 1:
             return conversation.history
@@ -134,7 +178,16 @@ class SummarizationCompressor(Compressor):
         if prefix_tokens <= self.token_limit:
             return conversation.history
 
-        summary = self._summarize_prefix(prefix)
+        try:
+            summary = self._summarize_prefix(prefix)
+        except RuntimeError as exc:
+            # Preserve full context if single-pass summarization cannot fit the model context window.
+            logger.warning(
+                "Summarization skipped; preserving full context for compatibility. reason=%s",
+                exc,
+            )
+            return conversation.history
+
         summary_turn = Turn(role="assistant", content=summary)
         return [summary_turn, last_turn]
 

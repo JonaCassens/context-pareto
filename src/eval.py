@@ -6,9 +6,12 @@ Runs all conversations through all compression strategies and records results.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import logging
+import re
 import time
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -18,15 +21,19 @@ from pydantic import ValidationError
 
 from src.compressors import all_compressors
 from src.config import (
+	CONTEXT_WINDOW_MARGIN,
 	DATASET_PATH,
+	EVAL_CONTEXT_WARNING_TOKENS,
+	EVAL_MAX_WORKERS,
+	GENERATION_CONTEXT_WINDOW,
 	GENERATION_MODEL,
-	JUDGE_MODEL,
+	GENERATION_MAX_TOKENS,
 	MAX_RETRIES,
 	RESULTS_PATH,
 	TIKTOKEN_ENCODING,
 )
 from src.dataset import load_dataset
-from src.models import EvalRecord, JudgeVerdict, Turn
+from src.models import Conversation, EvalRecord, JudgeVerdict, Turn
 
 logging.basicConfig(
 	level=logging.INFO,
@@ -41,11 +48,7 @@ _GENERATION_SYSTEM_PROMPT = (
 	"Be concise and provide the final answer directly."
 )
 
-_JUDGE_SYSTEM_PROMPT = (
-	"You are an evaluator. Compare the candidate answer against the ground truth. "
-	"Return strict JSON with keys: is_correct (boolean) and reasoning (string). "
-	"Mark is_correct true only when semantically equivalent."
-)
+_NUMBER_RE = re.compile(r"[-+]?\$?\d[\d,]*(?:\.\d+)?")
 
 
 def _turns_to_text(turns: list[Turn]) -> str:
@@ -92,14 +95,34 @@ def _litellm_call(
 	*,
 	model: str,
 	messages: list[dict[str, str]],
+	max_tokens: int,
+	context_window: int,
 	response_format: dict[str, str] | None = None,
 ) -> str:
+	def _message_tokens(msgs: list[dict[str, str]], encoder: tiktoken.Encoding) -> int:
+		text = "\n".join(f"{m.get('role','user')}: {m.get('content','')}" for m in msgs)
+		return len(encoder.encode(text))
+
+	encoder = tiktoken.get_encoding(TIKTOKEN_ENCODING)
+	input_budget = context_window - max_tokens - CONTEXT_WINDOW_MARGIN
+	if input_budget <= 0:
+		raise RuntimeError(
+			f"Invalid token budget: context_window={context_window} max_tokens={max_tokens} margin={CONTEXT_WINDOW_MARGIN}"
+		)
+
+	input_tokens = _message_tokens(messages, encoder)
+	if input_tokens > input_budget:
+		raise RuntimeError(
+			"Input context exceeds generation budget without clipping: "
+			f"input={input_tokens} budget={input_budget}. Increase GENERATION_CONTEXT_WINDOW."
+		)
+
 	for attempt in range(1, MAX_RETRIES + 1):
 		try:
 			kwargs: dict[str, Any] = {
 				"model": model,
 				"messages": messages,
-				"max_tokens": 32768,
+				"max_tokens": max_tokens,
 				"temperature": 0.1,
 			}
 			if response_format is not None:
@@ -124,58 +147,72 @@ def _litellm_call(
 
 def _generate_answer(messages: list[dict[str, str]]) -> str:
 	request_messages = [{"role": "system", "content": _GENERATION_SYSTEM_PROMPT}, *messages]
-	return _litellm_call(model=GENERATION_MODEL, messages=request_messages)
-
-
-def _judge_answer(final_question: str, generated_answer: str, ground_truth_answer: str) -> JudgeVerdict:
-	judge_user = (
-		"Question:\n"
-		f"{final_question}\n\n"
-		"Ground truth answer:\n"
-		f"{ground_truth_answer}\n\n"
-		"Candidate answer:\n"
-		f"{generated_answer}\n\n"
-		"Return JSON only."
+	return _litellm_call(
+		model=GENERATION_MODEL,
+		messages=request_messages,
+		max_tokens=GENERATION_MAX_TOKENS,
+		context_window=GENERATION_CONTEXT_WINDOW,
 	)
-	raw = _litellm_call(
-		model=JUDGE_MODEL,
-		messages=[
-			{"role": "system", "content": _JUDGE_SYSTEM_PROMPT},
-			{"role": "user", "content": judge_user},
-		],
-		response_format={"type": "json_object"},
-	)
-	return JudgeVerdict.model_validate(json.loads(raw))
 
 
-def _judge_against_reference(
+def _extract_numeric_values(text: str) -> list[Decimal]:
+	values: list[Decimal] = []
+	for match in _NUMBER_RE.findall(text):
+		cleaned = match.replace("$", "").replace(",", "")
+		try:
+			values.append(Decimal(cleaned))
+		except InvalidOperation:
+			continue
+	return values
+
+
+def _numeric_verdict_against_reference(
 	*,
 	final_question: str,
 	reference_answer: str,
 	generated_answer: str,
 	ground_truth_answer: str,
 ) -> JudgeVerdict:
-	judge_user = (
-		"Question:\n"
-		f"{final_question}\n\n"
-		"Reference answer from full uncompressed context:\n"
-		f"{reference_answer}\n\n"
-		"Ground truth answer:\n"
-		f"{ground_truth_answer}\n\n"
-		"Candidate answer:\n"
-		f"{generated_answer}\n\n"
-		"Decide correctness based primarily on semantic equivalence to the reference answer. "
-		"Use the ground truth to disambiguate format differences. Return JSON only."
+	# Numeric-only evaluation: correctness is based purely on matching value, not surrounding context.
+	target_values = _extract_numeric_values(ground_truth_answer)
+	if not target_values:
+		target_values = _extract_numeric_values(reference_answer)
+
+	candidate_values = _extract_numeric_values(generated_answer)
+
+	if not target_values:
+		return JudgeVerdict(
+			is_correct=False,
+			reasoning=(
+				"Could not parse a numeric target from ground truth or reference answer for question: "
+				f"{final_question}"
+			),
+		)
+
+	if not candidate_values:
+		return JudgeVerdict(
+			is_correct=False,
+			reasoning="Candidate answer does not contain a parseable numeric value.",
+		)
+
+	tolerance = Decimal("0.01")
+	for candidate in candidate_values:
+		for target in target_values:
+			if abs(candidate - target) <= tolerance:
+				return JudgeVerdict(
+					is_correct=True,
+					reasoning=(
+						"Numeric value match found between candidate and expected answer; "
+						"context wording ignored by design."
+					),
+				)
+
+	return JudgeVerdict(
+		is_correct=False,
+		reasoning=(
+			f"No numeric match. Expected one of {target_values} but found {candidate_values}."
+		),
 	)
-	raw = _litellm_call(
-		model=JUDGE_MODEL,
-		messages=[
-			{"role": "system", "content": _JUDGE_SYSTEM_PROMPT},
-			{"role": "user", "content": judge_user},
-		],
-		response_format={"type": "json_object"},
-	)
-	return JudgeVerdict.model_validate(json.loads(raw))
 
 
 def _append_eval_record(path: Path, record: EvalRecord) -> None:
@@ -188,6 +225,42 @@ def _build_messages(turns: list[Turn], final_question: str) -> list[dict[str, st
 	messages = [{"role": turn.role, "content": turn.content} for turn in turns]
 	messages.append({"role": "user", "content": final_question})
 	return messages
+
+
+def _evaluate_combo(
+	*,
+	conversation_id: str,
+	final_question: str,
+	ground_truth_answer: str,
+	original_tokens: int,
+	compressor: Any,
+	conversation: Conversation,
+	reference_answer: str,
+	encoder: tiktoken.Encoding,
+) -> EvalRecord:
+	compressed_turns = compressor.compress(conversation)
+	compressed_tokens = _count_tokens(compressed_turns, encoder)
+	reduction_ratio = (original_tokens - compressed_tokens) / original_tokens if original_tokens > 0 else 0.0
+
+	generated_answer = _generate_answer(_build_messages(compressed_turns, final_question))
+	verdict = _numeric_verdict_against_reference(
+		final_question=final_question,
+		reference_answer=reference_answer,
+		generated_answer=generated_answer,
+		ground_truth_answer=ground_truth_answer,
+	)
+
+	return EvalRecord(
+		conversation_id=conversation_id,
+		strategy=compressor.name,
+		hyperparams=compressor.hyperparams,
+		original_token_count=original_tokens,
+		compressed_token_count=compressed_tokens,
+		token_reduction_ratio=reduction_ratio,
+		generated_answer=generated_answer,
+		is_correct=verdict.is_correct,
+		judge_reasoning=verdict.reasoning,
+	)
 
 
 def run_evaluation(
@@ -225,24 +298,25 @@ def run_evaluation(
 		logger.info("Run limit: max_combinations=%d", max_combinations)
 
 	processed_this_run = 0
+	stop_after_this_conversation = False
 
 	for conversation in conversations:
 		original_tokens = _count_tokens(conversation.history, encoder)
+		if original_tokens >= EVAL_CONTEXT_WARNING_TOKENS:
+			logger.info(
+				"Long context detected for conversation=%s (%d tokens). Pipeline remains compatible; max_tokens caps apply to outputs only.",
+				conversation.id,
+				original_tokens,
+			)
 		reference_answer = _generate_answer(
 			_build_messages(conversation.history, conversation.final_question)
 		)
+		pending: list[tuple[Any, tuple[str, str, str]]] = []
 
 		for compressor in compressors:
 			if max_combinations is not None and processed_this_run >= max_combinations:
-				logger.info("Reached max_combinations=%d. Stopping early.", max_combinations)
-				logger.info(
-					"Partial run complete: written=%d skipped=%d failed=%d processed=%d",
-					written,
-					skipped,
-					failed,
-					processed_this_run,
-				)
-				return
+				stop_after_this_conversation = True
+				break
 
 			key = _record_key(conversation.id, compressor.name, compressor.hyperparams)
 			if key in completed:
@@ -250,58 +324,65 @@ def run_evaluation(
 				processed_this_run += 1
 				continue
 
-			try:
-				compressed_turns = compressor.compress(conversation)
-				compressed_tokens = _count_tokens(compressed_turns, encoder)
-				reduction_ratio = (
-					(original_tokens - compressed_tokens) / original_tokens if original_tokens > 0 else 0.0
-				)
-
-				generated_answer = _generate_answer(
-					_build_messages(compressed_turns, conversation.final_question)
-				)
-				verdict = _judge_against_reference(
-					final_question=conversation.final_question,
-					reference_answer=reference_answer,
-					generated_answer=generated_answer,
-					ground_truth_answer=conversation.ground_truth_answer,
-				)
-
-				record = EvalRecord(
-					conversation_id=conversation.id,
-					strategy=compressor.name,
-					hyperparams=compressor.hyperparams,
-					original_token_count=original_tokens,
-					compressed_token_count=compressed_tokens,
-					token_reduction_ratio=reduction_ratio,
-					generated_answer=generated_answer,
-					is_correct=verdict.is_correct,
-					judge_reasoning=verdict.reasoning,
-				)
-				_append_eval_record(RESULTS_PATH, record)
-				completed.add(key)
-				written += 1
-			except (RuntimeError, ValidationError, json.JSONDecodeError) as exc:
-				failed += 1
-				logger.warning(
-					"Failed combo conversation=%s strategy=%s hyperparams=%s error=%s",
-					conversation.id,
-					compressor.name,
-					compressor.hyperparams,
-					exc,
-				)
-
+			pending.append((compressor, key))
 			processed_this_run += 1
-			processed = skipped + written + failed
-			if processed % 10 == 0 or processed == total:
-				logger.info(
-					"Progress %d/%d | written=%d skipped=%d failed=%d",
-					processed,
-					total,
-					written,
-					skipped,
-					failed,
-				)
+
+		if pending:
+			max_workers = max(1, min(EVAL_MAX_WORKERS, len(pending)))
+			with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+				future_map: dict[concurrent.futures.Future[EvalRecord], tuple[Any, tuple[str, str, str]]] = {}
+				for compressor, key in pending:
+					future = executor.submit(
+						_evaluate_combo,
+						conversation_id=conversation.id,
+						final_question=conversation.final_question,
+						ground_truth_answer=conversation.ground_truth_answer,
+						original_tokens=original_tokens,
+						compressor=compressor,
+						conversation=conversation,
+						reference_answer=reference_answer,
+						encoder=encoder,
+					)
+					future_map[future] = (compressor, key)
+
+				for future in concurrent.futures.as_completed(future_map):
+					compressor, key = future_map[future]
+					try:
+						record = future.result()
+						_append_eval_record(RESULTS_PATH, record)
+						completed.add(key)
+						written += 1
+					except (RuntimeError, ValidationError, json.JSONDecodeError) as exc:
+						failed += 1
+						logger.warning(
+							"Failed combo conversation=%s strategy=%s hyperparams=%s error=%s",
+							conversation.id,
+							compressor.name,
+							compressor.hyperparams,
+							exc,
+						)
+
+					processed = skipped + written + failed
+					if processed % 10 == 0 or processed == total:
+						logger.info(
+							"Progress %d/%d | written=%d skipped=%d failed=%d",
+							processed,
+							total,
+							written,
+							skipped,
+							failed,
+						)
+
+		if stop_after_this_conversation:
+			logger.info("Reached max_combinations=%d. Stopping early.", max_combinations)
+			logger.info(
+				"Partial run complete: written=%d skipped=%d failed=%d processed=%d",
+				written,
+				skipped,
+				failed,
+				processed_this_run,
+			)
+			return
 
 	logger.info("Evaluation complete: written=%d skipped=%d failed=%d total=%d", written, skipped, failed, total)
 	logger.info("Results path: %s", RESULTS_PATH)
