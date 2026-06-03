@@ -27,9 +27,9 @@ class Conversation(BaseModel):
 
     ``critical_turn_indices`` lists the 0-based indices into ``history`` that
     contain information *required* to correctly answer ``final_question``.
-    At least one index must fall in the first third of ``history`` and at
-    least one must fall in the last third — this is what makes the dependency
-    chain non-trivial to compress.
+    At least one index must fall in the last third of ``history`` and at least
+    one index must fall before the last third. This preserves long-range
+    dependency pressure while allowing different index-layout archetypes.
     """
 
     id: str
@@ -53,16 +53,15 @@ class Conversation(BaseModel):
     @model_validator(mode="after")
     def validate_dependency_spread(self) -> "Conversation":
         n = len(self.history)
-        first_third_boundary = n // 3
         last_third_boundary = n - n // 3
 
-        has_early = any(i < first_third_boundary for i in self.critical_turn_indices)
+        has_pre_late = any(i < last_third_boundary for i in self.critical_turn_indices)
         has_late = any(i >= last_third_boundary for i in self.critical_turn_indices)
 
-        if not has_early:
+        if not has_pre_late:
             raise ValueError(
                 f"critical_turn_indices {self.critical_turn_indices} must include "
-                f"at least one index in the first third of history (< {first_third_boundary})."
+                f"at least one index before the last third of history (< {last_third_boundary})."
             )
         if not has_late:
             raise ValueError(

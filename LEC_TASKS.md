@@ -121,6 +121,8 @@ Last updated: 2026-06-03
     - hybrid hyperparams now logged as k + recent_window + summary_token_limit
   - Updated report failure-case inference to remain API-free with the revised hybrid behavior.
   - Re-ran compressor smoke tests and confirmed all checks pass.
+  - Executed first post-redesign eval run: hybrid strategy, 1 conversation, 3 combinations written.
+  - Regenerated report artifacts after first run; current snapshot recommends hybrid on available rows.
 
 ## Remaining Work Checklist
 
@@ -143,7 +145,7 @@ Last updated: 2026-06-03
 - [x] Replace HybridCompressor implementation to remove final_question dependency
 - [x] Update all_compressors() factory to instantiate revised hybrid values
 - [x] Update smoke tests for revised hybrid behavior
-- [ ] Re-run bounded eval and refresh report artifacts due to strategy behavior change
+- [x] Re-run bounded eval and refresh report artifacts due to strategy behavior change
 
 ### Milestone 4 report.py
 - [x] Load eval results from JSONL

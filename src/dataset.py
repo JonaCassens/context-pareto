@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
 import logging
 import sys
@@ -126,6 +127,10 @@ critical_turn_indices: [0, 5]      ← turn 0 has the quantity; turn 5 has the p
 The bay-4 repair info (turns 2–3) is an intentional distractor.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+CRITICAL INDEX LAYOUT CONSTRAINT FOR THIS REQUEST
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{critical_layout_instruction}
+
 Now generate {n} NEW conversations following all rules above.
 Return ONLY a JSON object matching this schema:
 
@@ -146,9 +151,53 @@ Return ONLY a JSON object matching this schema:
 """
 
 
-def build_batch_prompt(n: int, domain: str, target_turns: int) -> str:
+@dataclass(frozen=True)
+class CriticalIndexArchetype:
+    key: str
+    instruction: str
+
+
+CRITICAL_INDEX_ARCHETYPES: list[CriticalIndexArchetype] = [
+    CriticalIndexArchetype(
+        key="extreme",
+        instruction=(
+            "Produce the EXTREME layout: critical_turn_indices must include BOTH first two turns "
+            "(0 and 1) and BOTH last two turns (N-2 and N-1), where N=len(history)."
+        ),
+    ),
+    CriticalIndexArchetype(
+        key="middle_end",
+        instruction=(
+            "Produce the SIMPLER middle+end layout: critical_turn_indices must include at least one index in "
+            "the middle third and at least one index in the last third, with NO first-third index."
+        ),
+    ),
+    CriticalIndexArchetype(
+        key="three_way",
+        instruction=(
+            "Produce the THREE-WAY layout: critical_turn_indices must include at least one index from the first "
+            "third, one from the middle third, and one from the last third (minimum 3 indices total)."
+        ),
+    ),
+]
+
+
+def build_batch_prompt(
+    n: int,
+    domain: str,
+    target_turns: int,
+    critical_layout_instruction: str | None = None,
+) -> str:
     """Return the user-turn prompt for generating ``n`` conversations in ``domain``."""
-    return _BATCH_PROMPT_TEMPLATE.format(n=n, domain=domain, target_turns=target_turns)
+    layout_instruction = critical_layout_instruction or (
+        "No additional special layout beyond the required dependency-spread rules."
+    )
+    return _BATCH_PROMPT_TEMPLATE.format(
+        n=n,
+        domain=domain,
+        target_turns=target_turns,
+        critical_layout_instruction=layout_instruction,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +217,34 @@ def validate_dependency_spread(conv: Conversation) -> bool:
     has_early = any(i < first_third for i in conv.critical_turn_indices)
     has_late = any(i >= last_third_start for i in conv.critical_turn_indices)
     return has_early and has_late
+
+
+def validate_archetype(conv: Conversation, archetype_key: str | None) -> bool:
+    """Validate that critical indices match the requested per-batch archetype."""
+    if archetype_key is None:
+        return True
+
+    n = len(conv.history)
+    first_third = n // 3
+    last_third_start = n - n // 3
+
+    has_early = any(i < first_third for i in conv.critical_turn_indices)
+    has_middle = any(first_third <= i < last_third_start for i in conv.critical_turn_indices)
+    has_late = any(i >= last_third_start for i in conv.critical_turn_indices)
+
+    if archetype_key == "extreme":
+        has_first_two = 0 in conv.critical_turn_indices and 1 in conv.critical_turn_indices
+        has_last_two = (n - 2) in conv.critical_turn_indices and (n - 1) in conv.critical_turn_indices
+        return has_first_two and has_last_two
+
+    if archetype_key == "middle_end":
+        no_early = not has_early
+        return has_middle and has_late and no_early
+
+    if archetype_key == "three_way":
+        return has_early and has_middle and has_late and len(conv.critical_turn_indices) >= 3
+
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +306,7 @@ def generate_batch(
     model: str = GENERATION_MODEL,
     max_retries: int = MAX_RETRIES,
     target_turns: int = 8,
+    archetype: CriticalIndexArchetype | None = None,
 ) -> list[Conversation]:
     """
     Generate ``n`` conversations for the given ``domain``.
@@ -237,8 +315,20 @@ def generate_batch(
     dependency-spread rule) or have the wrong turn count up to ``max_retries``
     times per conversation.  Returns however many valid conversations were produced.
     """
-    logger.info("Generating batch: domain=%r  n=%d  turns=%d  model=%s", domain, n, target_turns, model)
-    prompt = build_batch_prompt(n=n, domain=domain, target_turns=target_turns)
+    logger.info(
+        "Generating batch: domain=%r n=%d turns=%d model=%s archetype=%s",
+        domain,
+        n,
+        target_turns,
+        model,
+        archetype.key if archetype else "default",
+    )
+    prompt = build_batch_prompt(
+        n=n,
+        domain=domain,
+        target_turns=target_turns,
+        critical_layout_instruction=archetype.instruction if archetype else None,
+    )
 
     raw_dict: dict[str, Any] = {}
     for attempt in range(1, max_retries + 1):
@@ -267,6 +357,13 @@ def generate_batch(
                     target_turns, len(conv.history),
                 )
                 invalid_raws.append(raw_conv)
+            elif not validate_archetype(conv, archetype.key if archetype else None):
+                logger.warning(
+                    "  ✗ Archetype mismatch: expected %s, got critical=%s",
+                    archetype.key if archetype else "default",
+                    conv.critical_turn_indices,
+                )
+                invalid_raws.append(raw_conv)
             else:
                 valid.append(conv)
                 logger.debug("  ✓ %s  (critical=%s)", conv.id, conv.critical_turn_indices)
@@ -277,7 +374,12 @@ def generate_batch(
     # Retry each invalid conversation individually.
     if invalid_raws:
         logger.info("  Re-generating %d failed conversations …", len(invalid_raws))
-        retry_prompt = build_batch_prompt(n=len(invalid_raws), domain=domain, target_turns=target_turns)
+        retry_prompt = build_batch_prompt(
+            n=len(invalid_raws),
+            domain=domain,
+            target_turns=target_turns,
+            critical_layout_instruction=archetype.instruction if archetype else None,
+        )
         for attempt in range(1, max_retries + 1):
             try:
                 retry_dict = _call_litellm(retry_prompt, model)
@@ -291,7 +393,8 @@ def generate_batch(
                 raw_conv["id"] = str(uuid.uuid4())
             try:
                 conv = Conversation.model_validate(raw_conv)
-                valid.append(conv)
+                if validate_archetype(conv, archetype.key if archetype else None):
+                    valid.append(conv)
             except ValidationError:
                 pass  # Accept partial results after retry.
 
@@ -313,13 +416,16 @@ def generate_conversations(
 
     for domain in GENERATION_DOMAINS:
         for target_turns in TURN_COUNTS:
-            batch = generate_batch(
-                domain=domain,
-                n=BATCH_SIZE,
-                model=model,
-                target_turns=target_turns,
-            )
-            all_conversations.extend(batch)
+            # Enforce one conversation per requested critical-index archetype.
+            for archetype in CRITICAL_INDEX_ARCHETYPES:
+                batch = generate_batch(
+                    domain=domain,
+                    n=1,
+                    model=model,
+                    target_turns=target_turns,
+                    archetype=archetype,
+                )
+                all_conversations.extend(batch)
 
     logger.info("Total valid conversations generated: %d / %d", len(all_conversations), total)
     return all_conversations
