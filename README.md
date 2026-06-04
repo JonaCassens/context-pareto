@@ -186,6 +186,15 @@ If I had another week, I would prioritise evaluation robustness over adding more
 - Docker Desktop (or Docker Engine)
 - API credentials via `.env` or host environment variables
 
+### Repo setup
+
+If you are starting from GitHub, clone the repository first and then run the Docker commands from the repo root:
+
+```bash
+git clone <repo-url>
+cd <repo-folder>
+```
+
 ### API key setup
 
 Option 1 (recommended): create a `.env` file in the repo root with at least one key:
