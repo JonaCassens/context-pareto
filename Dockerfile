@@ -11,3 +11,5 @@ RUN pip install -r /tmp/requirements.txt
 
 COPY . /work
 RUN mkdir -p data results plots
+
+CMD ["python", "-m", "src.report"]

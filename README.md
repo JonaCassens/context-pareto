@@ -6,7 +6,7 @@ This repo tests long-context compression for multi-turn conversations and shows 
 2. Summarization baseline
 3. Hybrid strategy (summary memory + selected anchors + recent verbatim turns)
 
-The full pipeline is reproducible with Docker-backed `make` commands.
+The full pipeline is reproducible with a standard Docker build and direct `docker run` commands.
 
 ## Why I Picked This Assignment
 
@@ -20,7 +20,7 @@ The assignment also suited the way I like to work: test multiple compressor desi
 
 - Used VS Code agent workflow over Cursor because I am more familiar with it and it keeps costs down.
 - Used Gemini-backed calls across generation and eval for a simple, consistent setup.
-- Used Docker + Make so the project can be run on one machine without unusual setup.
+- Used Docker so the project can be run on one machine without unusual setup.
 
 ### Benchmark design choices
 
@@ -184,23 +184,19 @@ If I had another week, I would prioritise evaluation robustness over adding more
 ### Prerequisites
 
 - Docker Desktop (or Docker Engine)
-- GNU Make (`make`)
 - API credentials via `.env` or host environment variables
 
 ### API key setup
 
-Option 1 (recommended):
+Option 1 (recommended): create a `.env` file in the repo root with at least one key:
 
 ```bash
-make init-env
+GOOGLE_API_KEY=...
+# or
+ANTHROPIC_API_KEY=...
 ```
 
-Then set at least one key in `.env`:
-
-- `GOOGLE_API_KEY=...`
-- `ANTHROPIC_API_KEY=...`
-
-Option 2 (host env):
+Option 2: set host environment variables before running Docker:
 
 ```powershell
 $env:GOOGLE_API_KEY="your_key_here"
@@ -209,51 +205,52 @@ $env:GOOGLE_API_KEY="your_key_here"
 ### Quick run
 
 ```bash
-make run
+docker build -t lec-eval:latest .
+docker run --rm --env-file .env -e GOOGLE_API_KEY -e ANTHROPIC_API_KEY -v "${PWD}:/work" -w /work lec-eval:latest
 ```
 
-Default `make run` behaviour:
-
-1. Uses existing `results/eval_results.jsonl`
-2. Regenerates plots only (`plots/*`)
-3. Does not regenerate dataset/eval/summaries/findings unless requested
+By default, the image runs `python -m src.report`, so this command regenerates plots from the current results.
 
 ### Regeneration options
 
 Regenerate summaries and findings:
 
 ```bash
-make run REGEN_SUMMARIES=1 REGEN_FINDINGS=1
+docker run --rm --env-file .env -e GOOGLE_API_KEY -e ANTHROPIC_API_KEY -v "${PWD}:/work" -w /work lec-eval:latest python -m src.report --regen-summaries --regen-findings
 ```
 
 Regenerate eval (with quick bounded run args example):
 
 ```bash
-make run REGEN_EVAL=1 EVAL_ARGS="--max-conversations 5 --max-combinations 30"
+docker run --rm --env-file .env -e GOOGLE_API_KEY -e ANTHROPIC_API_KEY -v "${PWD}:/work" -w /work lec-eval:latest python -m src.eval --max-conversations 5 --max-combinations 30
 ```
 
 Regenerate dataset and eval:
 
 ```bash
-make run REGEN_DATA=1 REGEN_EVAL=1
+docker run --rm --env-file .env -e GOOGLE_API_KEY -e ANTHROPIC_API_KEY -v "${PWD}:/work" -w /work lec-eval:latest python -m src.dataset
+docker run --rm --env-file .env -e GOOGLE_API_KEY -e ANTHROPIC_API_KEY -v "${PWD}:/work" -w /work lec-eval:latest python -m src.eval
 ```
 
 Deterministic extraction mode from existing source:
 
 ```bash
-make run REGEN_DATA=1 REGEN_EVAL=1 DATA_ARGS="--extract-from-source --source data/conversations.jsonl --n 36"
+docker run --rm --env-file .env -e GOOGLE_API_KEY -e ANTHROPIC_API_KEY -v "${PWD}:/work" -w /work lec-eval:latest python -m src.dataset --extract-from-source --source data/conversations.jsonl --n 36
 ```
 
-Full rebuild convenience target:
+Full rebuild sequence:
 
 ```bash
-make run-regen
+docker build -t lec-eval:latest .
+docker run --rm --env-file .env -e GOOGLE_API_KEY -e ANTHROPIC_API_KEY -v "${PWD}:/work" -w /work lec-eval:latest python -m src.dataset --extract-from-source --source data/conversations.jsonl --n 36
+docker run --rm --env-file .env -e GOOGLE_API_KEY -e ANTHROPIC_API_KEY -v "${PWD}:/work" -w /work lec-eval:latest python -m src.eval
+docker run --rm --env-file .env -e GOOGLE_API_KEY -e ANTHROPIC_API_KEY -v "${PWD}:/work" -w /work lec-eval:latest python -m src.report --regen-summaries --regen-findings
 ```
 
 ### Discoverability
 
 ```bash
-make help
+docker run --rm --env-file .env -e GOOGLE_API_KEY -e ANTHROPIC_API_KEY -v "${PWD}:/work" -w /work lec-eval:latest python -m src.report --help
 ```
 
 ### Generated outputs
@@ -268,4 +265,4 @@ make help
 
 ### Notes for Windows
 
-If `make` is unavailable in PowerShell, install GNU Make (for example via Chocolatey) or run via WSL/Git Bash.
+Use PowerShell or Git Bash for the `docker run` commands. If you prefer a shell with POSIX-style variable expansion, use Git Bash or WSL.
