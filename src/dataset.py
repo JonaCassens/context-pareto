@@ -1,22 +1,22 @@
 """
 Dataset generator for the context-compression evaluation pipeline.
 
-Generates 30 synthetic multi-turn conversations where the correct answer to
-the final question depends on combining information from *early* turns AND
-*late* turns — making the dependency chain non-trivial for any compression
-strategy that only keeps a sliding window or naive summary.
+Default mode is LLM generation with strict post-generation validation.
+Extraction from an existing JSONL file is optional and opt-in.
 
 Usage:
-    python -m src.dataset                         # generates data/conversations.jsonl
-    python -m src.dataset --n 10 --out custom.jsonl
+    python -m src.dataset
+    python -m src.dataset --n 36 --out data/conversations.jsonl
+    python -m src.dataset --extract-from-source --source data/conversations.jsonl
 """
 
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 import json
 import logging
+import random
+import re
 import sys
 import uuid
 from pathlib import Path
@@ -31,13 +31,18 @@ from pydantic import ValidationError
 from src.config import (
     BATCH_SIZE,
     CONTEXT_WINDOW_MARGIN,
+    DATASET_CHECKPOINT_EVERY,
     DATASET_PATH,
     DATASET_GENERATION_CONTEXT_WINDOW,
     DATASET_GENERATION_MAX_TOKENS,
     DATASET_SIZE,
-    GENERATION_DOMAINS,
     GENERATION_MODEL,
+    GENERATION_DOMAINS,
+    LLM_REQUEST_TIMEOUT_SECONDS,
     MAX_RETRIES,
+    RETRY_BASE_DELAY_SECONDS,
+    RETRY_JITTER_SECONDS,
+    RETRY_MAX_DELAY_SECONDS,
     TURN_COUNTS,
 )
 from src.models import Conversation, GeneratedDataset
@@ -48,6 +53,9 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+_NUMBER_RE = re.compile(r"[-+]?\$?\d[\d,]*(?:\.\d+)?")
+_DATASET_TEMPERATURE = 0.4
 
 # ---------------------------------------------------------------------------
 # Prompt construction
@@ -66,9 +74,8 @@ Generate exactly {n} synthetic multi-turn conversations in the domain of \
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 STRUCTURAL RULES
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-1. Each conversation must have EXACTLY {target_turns} history turns (role
-   alternates user / assistant, starting with user). Do NOT use more or
-   fewer turns — this count is a strict requirement.
+1. Each conversation must have EXACTLY {target_turns} history turns. Roles
+    alternate user / assistant, starting with user.
 2. The conversation ends with a `final_question` posed by the user that is
    NOT part of `history`.
 3. `ground_truth_answer` is the single, unambiguous correct answer to
@@ -77,41 +84,27 @@ STRUCTURAL RULES
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 DEPENDENCY CHAIN RULES  ← most important
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-4. EARLY ANCHOR (turns 0–1): The user establishes a specific, concrete fact
-   (a numeric quantity, a named entity attribute, a rate or price). The
-   assistant acknowledges it. Label the relevant turn index in
-   `critical_turn_indices`.
-
-5. DISTRACTOR ZONE (turns 2 through N-3): The conversation pivots to
-   a completely different subject within the same domain. Introduce new
-   named entities, numbers, and transactions that are plausible but are
-   NOT required to answer the final question. These turns should be long
-   and detailed enough to tempt a compression model into keeping them.
-
-6. LATE ANCHOR (last 2 turns of history, turns N-2 and N-1): A second
-   essential fact is introduced — a modifier, rate, constraint, or second
-   quantity that, combined ONLY with the early anchor, yields the answer.
-   Label the relevant turn index in `critical_turn_indices`.
-
-7. The `final_question` MUST be unanswerable using ONLY the early anchor OR
-   ONLY the late anchor. The answer requires multiplying, combining, or
-   applying one to the other. Verify this before writing the question.
-
-8. `critical_turn_indices` must contain at least:
-   - one index that is < floor(N / 3)          ← early anchor index
-   - one index that is >= N - floor(N / 3)     ← late anchor index
-   where N = len(history).
+4. `critical_turn_indices` MUST contain exactly two indices.
+5. One critical index MUST be in turns 0-2 (inclusive): first required anchor.
+6. One critical index MUST be in turns N-3 to N-1 (inclusive), where N is
+    len(history): second required anchor.
+7. Both anchors must be necessary to compute the final answer. The final
+    question must be unanswerable with only one anchor.
+8. Include misleading values in non-critical turns. Misleading values are also
+    allowed in critical turns, but they must not remove two-anchor necessity.
+9. The `final_question` MUST NOT contain numeric literals.
+10. Do NOT place the final computed answer value in any history turn.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 QUALITY RULES
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-9. Use distinct named entities (people, products, projects) across all {n}
+12. Use distinct named entities (people, products, projects) across all {n}
    conversations — do not reuse "Alice", "Widget A", or any other name more
    than once across the batch.
-10. Vary the type of dependency: use multiplication, percentage application,
-    date arithmetic, conditional lookup, and unit conversion across the batch.
-11. Each `id` must be a unique UUID v4 string.
-12. Set `domain` to "{domain}".
+13. Vary dependency style across the batch: multiplication, percentage
+    adjustment, lookup with modifier, and unit conversion.
+14. Each `id` must be a unique UUID v4 string.
+15. Set `domain` to "{domain}".
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 WORKED EXAMPLE (do NOT copy this — only use it as a structural template)
@@ -131,10 +124,6 @@ critical_turn_indices: [0, 5]      ← turn 0 has the quantity; turn 5 has the p
 The bay-4 repair info (turns 2–3) is an intentional distractor.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-CRITICAL INDEX LAYOUT CONSTRAINT FOR THIS REQUEST
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-{critical_layout_instruction}
-
 Now generate {n} NEW conversations following all rules above.
 Return ONLY a JSON object matching this schema:
 
@@ -153,54 +142,16 @@ Return ONLY a JSON object matching this schema:
   ]
 }}
 """
-
-
-@dataclass(frozen=True)
-class CriticalIndexArchetype:
-    key: str
-    instruction: str
-
-
-CRITICAL_INDEX_ARCHETYPES: list[CriticalIndexArchetype] = [
-    CriticalIndexArchetype(
-        key="extreme",
-        instruction=(
-            "Produce the EXTREME layout: critical_turn_indices must include BOTH first two turns "
-            "(0 and 1) and BOTH last two turns (N-2 and N-1), where N=len(history)."
-        ),
-    ),
-    CriticalIndexArchetype(
-        key="middle_end",
-        instruction=(
-            "Produce the SIMPLER middle+end layout: critical_turn_indices must include at least one index in "
-            "the middle third and at least one index in the last third, with NO first-third index."
-        ),
-    ),
-    CriticalIndexArchetype(
-        key="three_way",
-        instruction=(
-            "Produce the THREE-WAY layout: critical_turn_indices must include at least one index from the first "
-            "third, one from the middle third, and one from the last third (minimum 3 indices total)."
-        ),
-    ),
-]
-
-
 def build_batch_prompt(
     n: int,
     domain: str,
     target_turns: int,
-    critical_layout_instruction: str | None = None,
 ) -> str:
     """Return the user-turn prompt for generating ``n`` conversations in ``domain``."""
-    layout_instruction = critical_layout_instruction or (
-        "No additional special layout beyond the required dependency-spread rules."
-    )
     return _BATCH_PROMPT_TEMPLATE.format(
         n=n,
         domain=domain,
         target_turns=target_turns,
-        critical_layout_instruction=layout_instruction,
     )
 
 
@@ -211,44 +162,150 @@ def build_batch_prompt(
 
 def validate_dependency_spread(conv: Conversation) -> bool:
     """
-    Secondary (post-Pydantic) check that critical indices genuinely span
-    early and late thirds. Pydantic's model_validator already enforces this,
-    so this function is used for logging / manual inspection convenience.
+    Secondary check that one critical anchor exists in turns 0-2 and one
+    critical anchor exists in turns N-3..N-1.
     """
     n = len(conv.history)
-    first_third = n // 3
-    last_third_start = n - n // 3
-    has_early = any(i < first_third for i in conv.critical_turn_indices)
-    has_late = any(i >= last_third_start for i in conv.critical_turn_indices)
-    return has_early and has_late
+    early_window = set(range(0, min(3, n)))
+    late_window = set(range(max(0, n - 3), n))
+    first, second = conv.critical_turn_indices
+    early_count = int(first in early_window) + int(second in early_window)
+    late_count = int(first in late_window) + int(second in late_window)
+    return early_count == 1 and late_count == 1
 
 
-def validate_archetype(conv: Conversation, archetype_key: str | None) -> bool:
-    """Validate that critical indices match the requested per-batch archetype."""
-    if archetype_key is None:
-        return True
+def _extract_numeric_tokens(text: str) -> set[str]:
+    """Extract normalized numeric tokens from text for lightweight leakage checks."""
+    out: set[str] = set()
+    for raw in _NUMBER_RE.findall(text):
+        token = raw.replace("$", "").replace(",", "").strip()
+        if token:
+            out.add(token)
+    return out
 
-    n = len(conv.history)
-    first_third = n // 3
-    last_third_start = n - n // 3
 
-    has_early = any(i < first_third for i in conv.critical_turn_indices)
-    has_middle = any(first_third <= i < last_third_start for i in conv.critical_turn_indices)
-    has_late = any(i >= last_third_start for i in conv.critical_turn_indices)
+def _normalize_for_match(text: str) -> str:
+    """Normalize text for simple containment checks."""
+    lowered = text.lower().strip()
+    lowered = lowered.replace("$", "")
+    lowered = re.sub(r"\s+", " ", lowered)
+    return lowered
 
-    if archetype_key == "extreme":
-        has_first_two = 0 in conv.critical_turn_indices and 1 in conv.critical_turn_indices
-        has_last_two = (n - 2) in conv.critical_turn_indices and (n - 1) in conv.critical_turn_indices
-        return has_first_two and has_last_two
 
-    if archetype_key == "middle_end":
-        no_early = not has_early
-        return has_middle and has_late and no_early
+def _answer_leaked_verbatim(answer: str, turn_text: str) -> bool:
+    """Return True only when the full answer appears verbatim in a turn."""
+    normalized_answer = _normalize_for_match(answer)
+    if not normalized_answer:
+        return False
+    return normalized_answer in _normalize_for_match(turn_text)
 
-    if archetype_key == "three_way":
-        return has_early and has_middle and has_late and len(conv.critical_turn_indices) >= 3
 
-    return False
+def validate_required_dependency(conv: Conversation) -> tuple[bool, str]:
+    """
+    Enforce simplified two-anchor requirements for numeric tasks.
+
+    Rules:
+    1) final_question must not contain numeric literals (prevents leaking operands).
+    2) Exactly one critical anchor must be early (0-2) and one late (N-3..N-1).
+    3) At least two distinct numeric operands must appear across critical turns.
+    4) Keep misleading values possible while preserving two-anchor necessity.
+    """
+    question_numbers = _extract_numeric_tokens(conv.final_question)
+    if question_numbers:
+        return (False, "final_question leaks numeric literals; answer can become single-anchor solvable")
+
+    if not validate_dependency_spread(conv):
+        return (False, "critical_turn_indices must include one early (0-2) and one late (N-3..N-1) index")
+
+    critical_number_sets: dict[int, set[str]] = {
+        idx: _extract_numeric_tokens(conv.history[idx].content)
+        for idx in conv.critical_turn_indices
+    }
+    combined_critical_numbers: set[str] = set().union(*critical_number_sets.values())
+
+    if len(combined_critical_numbers) < 2:
+        return (
+            False,
+            "critical turns do not provide at least two distinct numeric operands",
+        )
+
+    return (True, "ok")
+
+
+def evaluate_conversation_quality(conv: Conversation) -> tuple[bool, list[str]]:
+    """
+    Evaluate whether a generated conversation is admissible for this benchmark.
+
+    Returns ``(is_valid, reasons)`` where ``reasons`` contains all failed checks.
+    """
+    reasons: list[str] = []
+
+    # Enforce alternating user/assistant turns starting with user.
+    expected_roles = ["user" if i % 2 == 0 else "assistant" for i in range(len(conv.history))]
+    actual_roles = [turn.role for turn in conv.history]
+    if actual_roles != expected_roles:
+        reasons.append("history roles must alternate user/assistant starting with user")
+
+    dep_ok, dep_reason = validate_required_dependency(conv)
+    if not dep_ok:
+        reasons.append(dep_reason)
+
+    if not validate_dependency_spread(conv):
+        reasons.append("critical_turn_indices must include one early and one late anchor")
+
+    if not _extract_numeric_tokens(conv.ground_truth_answer):
+        reasons.append("ground_truth_answer must contain at least one numeric value")
+
+    question_numbers = _extract_numeric_tokens(conv.final_question)
+    if question_numbers:
+        reasons.append("final_question must not contain numeric literals")
+
+    # Avoid exact final-answer leakage in conversation history.
+    for idx, turn in enumerate(conv.history):
+        if _answer_leaked_verbatim(conv.ground_truth_answer, turn.content):
+            reasons.append(f"history turn {idx} leaks final answer value")
+            break
+
+    return (len(reasons) == 0, reasons)
+
+
+def _sanitize_question_no_numbers(question: str) -> str:
+    """Remove numeric literals from a question while preserving readability."""
+    sanitized = _NUMBER_RE.sub("", question)
+    sanitized = re.sub(r"\s+", " ", sanitized).strip(" ,.;:")
+    if sanitized and not sanitized.endswith("?"):
+        sanitized = f"{sanitized}?"
+    return sanitized
+
+
+def validate_or_repair_conversation(conv: Conversation) -> tuple[Conversation | None, list[str]]:
+    """
+    Validate a conversation and apply lightweight deterministic repair when safe.
+
+    Current repair policy:
+    - If only question-number leakage is present, remove numeric literals from
+      final_question and re-validate.
+    """
+    is_valid, reasons = evaluate_conversation_quality(conv)
+    if is_valid:
+        return conv, []
+
+    leakage_markers = {
+        "final_question must not contain numeric literals",
+        "final_question leaks numeric literals; answer can become single-anchor solvable",
+    }
+    non_leakage_reasons = [r for r in reasons if r not in leakage_markers]
+
+    if not non_leakage_reasons:
+        fixed_question = _sanitize_question_no_numbers(conv.final_question)
+        if fixed_question:
+            repaired = conv.model_copy(update={"final_question": fixed_question})
+            repaired_ok, repaired_reasons = evaluate_conversation_quality(repaired)
+            if repaired_ok:
+                return repaired, []
+            return None, repaired_reasons
+
+    return None, reasons
 
 
 # ---------------------------------------------------------------------------
@@ -286,6 +343,24 @@ def _call_litellm(
             f"prompt={prompt_tokens} budget={input_budget}. Increase DATASET_GENERATION_CONTEXT_WINDOW."
         )
 
+    def _parse_llm_json(raw: str) -> dict[str, Any]:
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+            cleaned = re.sub(r"\s*```$", "", cleaned)
+
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            pass
+
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            return json.loads(cleaned[start:end + 1])
+
+        raise json.JSONDecodeError("No JSON object found", cleaned, 0)
+
     for attempt in range(1, max_retries + 1):
         try:
             response = litellm.completion(
@@ -295,19 +370,21 @@ def _call_litellm(
                     {"role": "user", "content": prompt},
                 ],
                 response_format={"type": "json_object"},
-                temperature=0.9,
+                temperature=_DATASET_TEMPERATURE,
                 max_tokens=DATASET_GENERATION_MAX_TOKENS,
+                timeout=LLM_REQUEST_TIMEOUT_SECONDS,
             )
             raw = response.choices[0].message.content
             try:
-                return json.loads(raw)
+                return _parse_llm_json(raw)
             except json.JSONDecodeError as exc:
                 raise RuntimeError(f"LLM returned non-JSON content: {raw[:200]}") from exc
 
         except (litellm.RateLimitError, litellm.ServiceUnavailableError) as exc:
-            wait = 2 ** attempt  # 2s, 4s, 8s …
+            wait = min(RETRY_MAX_DELAY_SECONDS, RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1)))
+            wait = wait + random.uniform(0.0, RETRY_JITTER_SECONDS)
             logger.warning(
-                "Transient API error (attempt %d/%d). Waiting %ds before retry. %s",
+                "Transient API error (attempt %d/%d). Waiting %.1fs before retry. %s",
                 attempt, max_retries, wait, exc,
             )
             if attempt == max_retries:
@@ -329,7 +406,6 @@ def generate_batch(
     model: str = GENERATION_MODEL,
     max_retries: int = MAX_RETRIES,
     target_turns: int = 8,
-    archetype: CriticalIndexArchetype | None = None,
 ) -> list[Conversation]:
     """
     Generate ``n`` conversations for the given ``domain``.
@@ -339,18 +415,16 @@ def generate_batch(
     times per conversation.  Returns however many valid conversations were produced.
     """
     logger.info(
-        "Generating batch: domain=%r n=%d turns=%d model=%s archetype=%s",
+        "Generating batch: domain=%r n=%d turns=%d model=%s",
         domain,
         n,
         target_turns,
         model,
-        archetype.key if archetype else "default",
     )
     prompt = build_batch_prompt(
         n=n,
         domain=domain,
         target_turns=target_turns,
-        critical_layout_instruction=archetype.instruction if archetype else None,
     )
 
     raw_dict: dict[str, Any] = {}
@@ -380,16 +454,15 @@ def generate_batch(
                     target_turns, len(conv.history),
                 )
                 invalid_raws.append(raw_conv)
-            elif not validate_archetype(conv, archetype.key if archetype else None):
-                logger.warning(
-                    "  ✗ Archetype mismatch: expected %s, got critical=%s",
-                    archetype.key if archetype else "default",
-                    conv.critical_turn_indices,
-                )
-                invalid_raws.append(raw_conv)
             else:
-                valid.append(conv)
-                logger.debug("  ✓ %s  (critical=%s)", conv.id, conv.critical_turn_indices)
+                repaired_conv, reasons = validate_or_repair_conversation(conv)
+                if repaired_conv is None:
+                    logger.warning("  ✗ Quality checks failed: %s", "; ".join(reasons))
+                    invalid_raws.append(raw_conv)
+                    continue
+
+                valid.append(repaired_conv)
+                logger.debug("  ✓ %s  (critical=%s)", repaired_conv.id, repaired_conv.critical_turn_indices)
         except ValidationError as exc:
             logger.warning("  ✗ Validation failed for a conversation: %s", exc.errors()[0]["msg"])
             invalid_raws.append(raw_conv)
@@ -401,7 +474,6 @@ def generate_batch(
             n=len(invalid_raws),
             domain=domain,
             target_turns=target_turns,
-            critical_layout_instruction=archetype.instruction if archetype else None,
         )
         for attempt in range(1, max_retries + 1):
             try:
@@ -416,8 +488,9 @@ def generate_batch(
                 raw_conv["id"] = str(uuid.uuid4())
             try:
                 conv = Conversation.model_validate(raw_conv)
-                if validate_archetype(conv, archetype.key if archetype else None):
-                    valid.append(conv)
+                repaired_conv, _ = validate_or_repair_conversation(conv)
+                if repaired_conv is not None:
+                    valid.append(repaired_conv)
             except ValidationError:
                 pass  # Accept partial results after retry.
 
@@ -428,30 +501,141 @@ def generate_batch(
 def generate_conversations(
     total: int = DATASET_SIZE,
     model: str = GENERATION_MODEL,
+    out_path: Path | None = None,
+    checkpoint_every: int = DATASET_CHECKPOINT_EVERY,
 ) -> list[Conversation]:
     """
-    Generate conversations with exactly 3 per (domain, turn_count) combination.
+    Generate conversations across configured domains and turn counts.
 
-    Produces 3 domains × 4 turn counts × 3 conversations = 36 total.
-    Each sub-batch (12 LLM calls) targets an exact turn count from TURN_COUNTS.
+    Turn count is constrained to configured values in TURN_COUNTS (6-10).
     """
     all_conversations: list[Conversation] = []
+    occupied_ids: set[str] = set()
 
-    for domain in GENERATION_DOMAINS:
-        for target_turns in TURN_COUNTS:
-            # Enforce one conversation per requested critical-index archetype.
-            for archetype in CRITICAL_INDEX_ARCHETYPES:
-                batch = generate_batch(
-                    domain=domain,
-                    n=1,
-                    model=model,
-                    target_turns=target_turns,
-                    archetype=archetype,
+    combinations: list[tuple[str, int]] = [
+        (domain, turns) for domain in GENERATION_DOMAINS for turns in TURN_COUNTS
+    ]
+    if not combinations:
+        logger.error("No generation combinations configured.")
+        return []
+
+    slot_idx = 0
+    while len(all_conversations) < total:
+        domain, target_turns = combinations[slot_idx % len(combinations)]
+        slot_idx += 1
+
+        conv: Conversation | None = None
+        for attempt in range(1, MAX_RETRIES + 1):
+            batch = generate_batch(
+                domain=domain,
+                n=1,
+                model=model,
+                target_turns=target_turns,
+            )
+            if not batch:
+                logger.warning(
+                    "Generation failed: domain=%s turns=%d attempt=%d/%d",
+                    domain,
+                    target_turns,
+                    attempt,
+                    MAX_RETRIES,
                 )
-                all_conversations.extend(batch)
+                continue
 
-    logger.info("Total valid conversations generated: %d / %d", len(all_conversations), total)
-    return all_conversations
+            candidate = batch[0]
+            if candidate.id in occupied_ids:
+                candidate = candidate.model_copy(update={"id": str(uuid.uuid4())})
+
+            repaired_conv, reasons = validate_or_repair_conversation(candidate)
+            if repaired_conv is None:
+                logger.warning(
+                    "Quality failure: domain=%s turns=%d reason=%s",
+                    domain,
+                    target_turns,
+                    "; ".join(reasons),
+                )
+                continue
+
+            conv = repaired_conv
+            break
+
+        if conv is None:
+            logger.error(
+                "Could not generate valid conversation: domain=%s turns=%d",
+                domain,
+                target_turns,
+            )
+            break
+
+        occupied_ids.add(conv.id)
+        all_conversations.append(conv)
+
+        if out_path is not None and (
+            len(all_conversations) % max(1, checkpoint_every) == 0
+            or len(all_conversations) >= total
+        ):
+            save_dataset(all_conversations, out_path)
+
+    # If custom ``total`` is requested, trim to that size while preserving ordering.
+    trimmed = all_conversations[:total]
+    logger.info("Total valid conversations generated: %d / %d", len(trimmed), total)
+    return trimmed
+
+
+def extract_conversations(
+    source: Path,
+    total: int = DATASET_SIZE,
+) -> list[Conversation]:
+    """
+    Deterministically extract validated conversations from an existing JSONL file.
+
+    Conversations are selected in deterministic order after validation.
+    """
+    if not source.exists():
+        logger.error("Source dataset file not found: %s", source)
+        return []
+
+    candidates = load_dataset(source)
+    if not candidates:
+        logger.error("No valid conversations found in source: %s", source)
+        return []
+
+    # Stable ordering keeps extraction deterministic across runs.
+    candidates = sorted(candidates, key=lambda c: c.id)
+
+    def _normalize_duplicate_ids(conversations: list[Conversation]) -> list[Conversation]:
+        """Keep IDs unique so downstream eval keys remain collision-free."""
+        seen: dict[str, int] = {}
+        normalized: list[Conversation] = []
+
+        for conv in conversations:
+            count = seen.get(conv.id, 0)
+            seen[conv.id] = count + 1
+            if count == 0:
+                normalized.append(conv)
+                continue
+
+            # Deterministic suffix ensures stable IDs across repeated runs.
+            new_id = f"{conv.id}__dup{count + 1}"
+            normalized.append(conv.model_copy(update={"id": new_id}))
+
+        duplicate_count = sum(v - 1 for v in seen.values() if v > 1)
+        if duplicate_count:
+            logger.warning(
+                "Normalized %d duplicate conversation IDs during extraction.",
+                duplicate_count,
+            )
+        return normalized
+
+    if total != DATASET_SIZE:
+        extracted = candidates[:total]
+        extracted = _normalize_duplicate_ids(extracted)
+        logger.info("Extracted %d/%d conversations from %s", len(extracted), total, source)
+        return extracted
+
+    selected = _normalize_duplicate_ids(candidates[:DATASET_SIZE])
+    logger.info("Extracted %d/%d conversations from %s", len(selected), total, source)
+    return selected[:total]
 
 
 # ---------------------------------------------------------------------------
@@ -478,6 +662,14 @@ def load_dataset(path: Path) -> list[Conversation]:
                 continue
             try:
                 conv = Conversation.model_validate_json(line)
+                is_valid, reasons = evaluate_conversation_quality(conv)
+                if not is_valid:
+                    logger.warning(
+                        "Line %d: quality validation error — %s",
+                        lineno,
+                        "; ".join(reasons),
+                    )
+                    continue
                 conversations.append(conv)
             except ValidationError as exc:
                 logger.warning("Line %d: validation error — %s", lineno, exc.errors()[0]["msg"])
@@ -515,10 +707,8 @@ def inspect_dataset(conversations: list[Conversation]) -> None:
     print("\nSample conversations (first 3):")
     for conv in conversations[:3]:
         n = len(conv.history)
-        first_third = n // 3
-        last_third_start = n - n // 3
-        early = [i for i in conv.critical_turn_indices if i < first_third]
-        late = [i for i in conv.critical_turn_indices if i >= last_third_start]
+        early = [i for i in conv.critical_turn_indices if i <= 2]
+        late = [i for i in conv.critical_turn_indices if i >= n - 3]
         print(f"\n  ID       : {conv.id}")
         print(f"  Domain   : {conv.domain}")
         print(f"  Turns    : {n}  (critical: {conv.critical_turn_indices})")
@@ -550,6 +740,15 @@ def main(argv: list[str] | None = None) -> None:
         help=f"Output JSONL path (default: {DATASET_PATH}).",
     )
     parser.add_argument(
+        "--source",
+        type=Path,
+        default=DATASET_PATH,
+        help=(
+            "Input JSONL source used for optional deterministic extraction "
+            f"(default: {DATASET_PATH})."
+        ),
+    )
+    parser.add_argument(
         "--model",
         type=str,
         default=GENERATION_MODEL,
@@ -560,9 +759,22 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="Print a summary of the generated dataset to stdout.",
     )
+    parser.add_argument(
+        "--extract-from-source",
+        action="store_true",
+        help="Use deterministic extraction from --source instead of LLM generation.",
+    )
     args = parser.parse_args(argv)
 
-    conversations = generate_conversations(total=args.n, model=args.model)
+    if args.extract_from_source:
+        conversations = extract_conversations(source=args.source, total=args.n)
+    else:
+        conversations = generate_conversations(
+            total=args.n,
+            model=args.model,
+            out_path=args.out,
+            checkpoint_every=DATASET_CHECKPOINT_EVERY,
+        )
 
     if not conversations:
         logger.error("No valid conversations generated. Exiting.")

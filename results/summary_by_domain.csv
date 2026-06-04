@@ -1,0 +1,10 @@
+domain,strategy,runs,accuracy,avg_token_reduction
+inventory and logistics,hybrid,45,60.0,0.1790917353636917
+inventory and logistics,summarization,45,48.888888888888886,0.23928951557762784
+inventory and logistics,sliding_window,45,4.444444444444445,0.47389808927561633
+personal finance and scheduling,hybrid,33,63.63636363636363,0.12326896806671998
+personal finance and scheduling,summarization,33,57.57575757575758,0.2687759614305145
+personal finance and scheduling,sliding_window,33,6.0606060606060606,0.46044987578599406
+project management and resource allocation,hybrid,30,50.0,0.09392813667596232
+project management and resource allocation,summarization,30,33.33333333333333,0.2714327767598053
+project management and resource allocation,sliding_window,30,6.666666666666667,0.4722140051106489

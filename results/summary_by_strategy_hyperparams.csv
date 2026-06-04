@@ -1,0 +1,10 @@
+strategy,hyperparams_key,runs,accuracy,avg_token_reduction
+hybrid,"k=6, recent_window=2, summary_token_limit=160",36,63.888888888888886,-0.037733062454819034
+hybrid,"k=2, recent_window=2, summary_token_limit=160",36,58.333333333333336,0.35127778273036436
+hybrid,"k=4, recent_window=2, summary_token_limit=160",36,52.77777777777778,0.10158995022019786
+sliding_window,window=6,36,16.666666666666664,0.21103111623420917
+sliding_window,window=2,36,0.0,0.7374485072682965
+sliding_window,window=4,36,0.0,0.4594837118213834
+summarization,token_limit=400,36,61.111111111111114,0.0
+summarization,token_limit=200,36,50.0,0.19429003146755025
+summarization,token_limit=100,36,30.555555555555557,0.5773938082822939

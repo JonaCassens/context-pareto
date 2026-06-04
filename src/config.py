@@ -50,6 +50,12 @@ GENERATION_MAX_TOKENS: int = max(32, int(os.getenv("GENERATION_MAX_TOKENS", "256
 SUMMARIZATION_MAX_TOKENS: int = max(64, int(os.getenv("SUMMARIZATION_MAX_TOKENS", "512")))
 DATASET_GENERATION_MAX_TOKENS: int = max(512, int(os.getenv("DATASET_GENERATION_MAX_TOKENS", "4096")))
 
+# Provider-call reliability tuning.
+LLM_REQUEST_TIMEOUT_SECONDS: float = float(os.getenv("LLM_REQUEST_TIMEOUT_SECONDS", "120"))
+RETRY_BASE_DELAY_SECONDS: float = float(os.getenv("RETRY_BASE_DELAY_SECONDS", "2"))
+RETRY_MAX_DELAY_SECONDS: float = float(os.getenv("RETRY_MAX_DELAY_SECONDS", "30"))
+RETRY_JITTER_SECONDS: float = float(os.getenv("RETRY_JITTER_SECONDS", "0.5"))
+
 # Emit an info log when a conversation reaches this many input tokens.
 EVAL_CONTEXT_WARNING_TOKENS: int = int(os.getenv("EVAL_CONTEXT_WARNING_TOKENS", "1000"))
 
@@ -84,10 +90,11 @@ HYBRID_SUMMARY_TOKEN_LIMIT: int = int(os.getenv("HYBRID_SUMMARY_TOKEN_LIMIT", "1
 # Dataset generation settings
 # ---------------------------------------------------------------------------
 
-DATASET_SIZE: int = 36            # 3 domains × 4 turn values × 3 conversations
-BATCH_SIZE: int = 3               # Conversations per turn-value sub-batch
-MAX_RETRIES: int = 3              # Max re-generation attempts per failed conversation
-TURN_COUNTS: list[int] = [6, 8, 10, 12]  # Exact history turn counts; 3 conversations each
+DATASET_SIZE: int = 36            # Default target sample size
+BATCH_SIZE: int = 3               # Conversations per generation sub-batch
+MAX_RETRIES: int = 6              # Max retries for transient provider errors
+TURN_COUNTS: list[int] = [6, 7, 8, 9, 10]  # Allowed history turn counts
+DATASET_CHECKPOINT_EVERY: int = max(1, int(os.getenv("DATASET_CHECKPOINT_EVERY", "1")))
 
 GENERATION_DOMAINS: list[str] = [
     "inventory and logistics",

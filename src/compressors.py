@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import time
 import re
+import random
 from abc import ABC, abstractmethod
 from threading import Lock
 
@@ -20,6 +21,10 @@ from src.config import (
     HYBRID_RECENT_WINDOW,
     HYBRID_SUMMARY_TOKEN_LIMIT,
     MAX_RETRIES,
+    LLM_REQUEST_TIMEOUT_SECONDS,
+    RETRY_BASE_DELAY_SECONDS,
+    RETRY_JITTER_SECONDS,
+    RETRY_MAX_DELAY_SECONDS,
     SUMMARIZATION_CONTEXT_WINDOW,
     SUMMARIZATION_MAX_TOKENS,
     SUMMARIZATION_MODEL,
@@ -132,6 +137,7 @@ class SummarizationCompressor(Compressor):
                     ],
                     max_tokens=SUMMARIZATION_MAX_TOKENS,
                     temperature=0.2,
+                    timeout=LLM_REQUEST_TIMEOUT_SECONDS,
                 )
                 content = response.choices[0].message.content
                 if not content or not content.strip():
@@ -140,7 +146,8 @@ class SummarizationCompressor(Compressor):
             except (litellm.RateLimitError, litellm.ServiceUnavailableError) as exc:
                 if attempt == MAX_RETRIES:
                     raise RuntimeError("Summarization failed after retries.") from exc
-                wait_seconds = 2 ** attempt
+                wait_seconds = min(RETRY_MAX_DELAY_SECONDS, RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1)))
+                wait_seconds = wait_seconds + random.uniform(0.0, RETRY_JITTER_SECONDS)
                 time.sleep(wait_seconds)
             except litellm.APIError as exc:
                 raise RuntimeError(f"Summarization API error: {exc}") from exc
@@ -214,9 +221,9 @@ class HybridCompressor(Compressor):
 
     def _turn_priority(self, turn: Turn, idx: int, total: int) -> tuple[float, int]:
         text = turn.content
-        has_number = bool(re.search(r"\\d", text))
-        has_unit = bool(re.search(r"\\b(?:usd|dollars?|%|kg|km|hours?|days?|weeks?|months?)\\b", text.lower()))
-        has_id = bool(re.search(r"\\b[A-Z]{2,}-?\\d{1,}\\b", text))
+        has_number = bool(re.search(r"\d", text))
+        has_unit = bool(re.search(r"\b(?:usd|dollars?|%|kg|km|hours?|days?|weeks?|months?)\b", text.lower()))
+        has_id = bool(re.search(r"\b[A-Z]{2,}-?\d{1,}\b", text))
         length_bonus = min(len(text) / 300.0, 1.0)
 
         # Encourage preserving both early and late anchors without using unseen future question.

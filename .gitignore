@@ -18,10 +18,12 @@ venv/
 env/
 
 # Pipeline outputs
-# data/
-results/
-plots/*
-!plots/*.png
+# data/*
+# results/
+# !results/eval_results.jsonl
+# !results/assignment3_findings.md
+# plots/*
+# !plots/*.png
 
 # Jupyter
 .ipynb_checkpoints/

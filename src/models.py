@@ -27,14 +27,13 @@ class Conversation(BaseModel):
 
     ``critical_turn_indices`` lists the 0-based indices into ``history`` that
     contain information *required* to correctly answer ``final_question``.
-    At least one index must fall in the last third of ``history`` and at least
-    one index must fall before the last third. This preserves long-range
-    dependency pressure while allowing different index-layout archetypes.
+    Exactly two anchors are required: one in turns 0-2 and one in the final
+    three turns of ``history``.
     """
 
     id: str
     domain: str = Field(description="High-level domain label (e.g. 'inventory', 'finance').")
-    history: list[Turn] = Field(min_length=6, max_length=12)
+    history: list[Turn] = Field(min_length=6, max_length=10)
     final_question: str
     ground_truth_answer: str = Field(
         description=(
@@ -45,29 +44,38 @@ class Conversation(BaseModel):
     critical_turn_indices: list[int] = Field(
         description=(
             "0-based indices into 'history' whose content is necessary to "
-            "answer final_question. Must span both early and late turns."
+            "answer final_question. Must include one early and one late anchor."
         ),
         min_length=2,
+        max_length=2,
     )
 
     @model_validator(mode="after")
     def validate_dependency_spread(self) -> "Conversation":
         n = len(self.history)
-        last_third_boundary = n - n // 3
+        if len(self.critical_turn_indices) != 2:
+            raise ValueError("critical_turn_indices must contain exactly two indices.")
 
-        has_pre_late = any(i < last_third_boundary for i in self.critical_turn_indices)
-        has_late = any(i >= last_third_boundary for i in self.critical_turn_indices)
+        early_window = set(range(0, min(3, n)))
+        late_window_start = max(0, n - 3)
+        late_window = set(range(late_window_start, n))
 
-        if not has_pre_late:
+        first, second = self.critical_turn_indices
+        if first == second:
+            raise ValueError("critical_turn_indices must reference two distinct turns.")
+
+        early_count = int(first in early_window) + int(second in early_window)
+        late_count = int(first in late_window) + int(second in late_window)
+
+        if early_count != 1:
             raise ValueError(
-                f"critical_turn_indices {self.critical_turn_indices} must include "
-                f"at least one index before the last third of history (< {last_third_boundary})."
+                "critical_turn_indices must contain exactly one index in turns 0-2."
             )
-        if not has_late:
+        if late_count != 1:
             raise ValueError(
-                f"critical_turn_indices {self.critical_turn_indices} must include "
-                f"at least one index in the last third of history (>= {last_third_boundary})."
+                "critical_turn_indices must contain exactly one index in the final three turns."
             )
+
         for idx in self.critical_turn_indices:
             if not (0 <= idx < n):
                 raise ValueError(
