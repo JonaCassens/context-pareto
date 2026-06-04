@@ -1,4 +1,4 @@
-# Assignment 3 - Context Compression Pareto Frontier
+# Context Compression Pareto Frontier
 
 This repo tests long-context compression for multi-turn conversations and shows the accuracy vs token trade-off across three strategies:
 
@@ -8,11 +8,11 @@ This repo tests long-context compression for multi-turn conversations and shows 
 
 The full pipeline is reproducible with a standard Docker build and direct `docker run` commands.
 
-## Why I Picked This Assignment
+## Why I Picked This Project
 
 I picked this project because I enjoy optimisation problems where you push efficiency until performance breaks. I have done work in RAG already, so I wanted to explore a different angle: how much context can be compressed before answer quality drops off.
 
-The assignment also suited the way I like to work: test multiple compressor designs on the same benchmark, measure token savings, and understand why failures happen rather than just chasing one headline number.
+This also suited the way I like to work: test multiple compressor designs on the same benchmark, measure token savings, and understand why failures happen rather than just chasing one headline number.
 
 ## Decisions and Alternatives
 
