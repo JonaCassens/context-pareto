@@ -5,6 +5,7 @@ Builds DataFrame, calculates metrics, plots Pareto frontier.
 
 from __future__ import annotations
 
+import argparse
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -411,7 +412,7 @@ def _write_assignment_findings(
 	logger.info("Wrote assignment findings: %s", path)
 
 
-def run_report() -> None:
+def run_report(*, regen_summaries: bool = False, regen_findings: bool = False) -> None:
 	PLOTS_DIR.mkdir(parents=True, exist_ok=True)
 
 	records = _load_eval_records(RESULTS_PATH)
@@ -420,34 +421,52 @@ def run_report() -> None:
 		return
 
 	df = _build_dataframe(records)
-	conversations = load_dataset(DATASET_PATH)
-	df = _attach_dataset_metadata(df)
 
 	logger.info("Loaded %d eval records", len(df))
 
-	_save_summary_tables(df)
 	_plot_accuracy_by_strategy(df)
 	_plot_compression_distribution(df)
 	_plot_tradeoff_scatter(df)
-
-	summary = _strategy_hyperparam_table(df)
-	cliffs = _find_cliff_points(summary)
-	recommended_strategy, strategy_rollup = _choose_recommended_strategy(summary)
-	failure_case = _build_failure_analysis(
-		df=df,
-		conversations=conversations,
-		recommended_strategy=recommended_strategy,
-	)
-	_write_assignment_findings(
-		summary=summary,
-		cliffs=cliffs,
-		strategy_rollup=strategy_rollup,
-		recommended_strategy=recommended_strategy,
-		failure_case=failure_case,
-	)
-
 	logger.info("Saved plots to %s", PLOTS_DIR)
+
+	if regen_summaries:
+		df_with_meta = _attach_dataset_metadata(df)
+		_save_summary_tables(df_with_meta)
+
+	if regen_findings:
+		conversations = load_dataset(DATASET_PATH)
+		summary = _strategy_hyperparam_table(df)
+		cliffs = _find_cliff_points(summary)
+		recommended_strategy, strategy_rollup = _choose_recommended_strategy(summary)
+		failure_case = _build_failure_analysis(
+			df=df,
+			conversations=conversations,
+			recommended_strategy=recommended_strategy,
+		)
+		_write_assignment_findings(
+			summary=summary,
+			cliffs=cliffs,
+			strategy_rollup=strategy_rollup,
+			recommended_strategy=recommended_strategy,
+			failure_case=failure_case,
+		)
+
+
+def _parse_args() -> argparse.Namespace:
+	parser = argparse.ArgumentParser(description="Generate evaluation plots and optional report artifacts")
+	parser.add_argument(
+		"--regen-summaries",
+		action="store_true",
+		help="Also regenerate summary CSV tables under results/",
+	)
+	parser.add_argument(
+		"--regen-findings",
+		action="store_true",
+		help="Also regenerate results/assignment3_findings.md",
+	)
+	return parser.parse_args()
 
 
 if __name__ == "__main__":
-	run_report()
+	args = _parse_args()
+	run_report(regen_summaries=args.regen_summaries, regen_findings=args.regen_findings)
